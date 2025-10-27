@@ -1,0 +1,2 @@
+Extracted PRED SQL: SELECT Shop_Name, Location FROM shop ORDER BY Shop_Name ASC;
+GT SQL: SELECT Shop_Name ,  LOCATION FROM shop ORDER BY Shop_Name ASC
