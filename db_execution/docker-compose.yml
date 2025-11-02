@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  sql-api:
+    build: .
+    ports:
+      - "8101:8000"
+    volumes:
+      - /home/datht/mats/data/spider:/app/data/spider:ro  # Mount pruned spider databases
+      - /home/datht/mats/data/bird:/app/data/bird:ro      # Mount pruned bird databases  
+      - /home/datht/mats/db_execution/logs:/app/logs      # Mount logs directory
+    environment:
+      - MAX_CONCURRENT=50
+      - DEFAULT_TIMEOUT_MS=60000
+      - MAX_ROWS=10000
+      - LOG_LEVEL=INFO
+    deploy:
+      resources:
+        limits:
+          # 70% of system memory (70GB) and CPU (16.8 cores of 24)
+          memory: 70G
+          cpus: '24'  # 70% of 24 cores (24 * 0.7 = 16.8)
+        reservations:
+          memory: 2G
+          cpus: '1.0'
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
