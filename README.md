@@ -14,3 +14,5 @@ It combines:
 ⚡ Runs efficiently on a single 24 GB GPU.
 
 ---
+
+**We are cleaning and updating the code for easy to use.**
