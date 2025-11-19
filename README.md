@@ -5,10 +5,11 @@
 ---
 
 FINER-SQL introduces **dense, interpretable rewards** to train **small language models (≤3B)** for Text-to-SQL via **Group Relative Policy Optimization (GRPO)**.  
-It combines:
+Beyond from Format Reward and Execution Reward, it combines:
+- **Memory Reward** — semantic alignment with verified reasoning traces  
+- **Atomic Reward** — atomic operation-level SQL overlap for structural feedback
 
-- 🧠 **Memory Reward** — semantic alignment with verified reasoning traces  
-- ⚙️ **Atomic Reward** — atomic operation-level SQL overlap for structural feedback  
+This helps solving the sparse reward issue of reinforcement learning in Text-to-SQL.
 
 ✅ Achieves 67.5% EX on BIRD when training only on BIRD train, and 85% EX on Spider using only a 3B model.  
 ⚡ Runs efficiently on a single 12-24 GB GPU.
