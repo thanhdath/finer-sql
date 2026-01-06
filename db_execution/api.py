@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 SPIDER_DB_ROOT = "/app/data/spider/database"
 BIRD_TRAIN_DB_ROOT = "/app/data/bird/train/train_databases"
 BIRD_DEV_DB_ROOT = "/app/data/bird/dev/dev_databases"
+SPIDER2_DB_ROOT = os.getenv("SPIDER2_DB_ROOT", "/home/datht/Spider2/spider2-lite/resource/databases/spider2-localdb")
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "100"))
 DEFAULT_TIMEOUT_MS = int(os.getenv("DEFAULT_TIMEOUT_MS", "120000"))
 MAX_ROWS = int(os.getenv("MAX_ROWS", "10000"))
@@ -32,7 +33,7 @@ gate = threading.Semaphore(MAX_CONCURRENT)
 # Models
 # -----------------------------
 class ExecuteRequest(BaseModel):
-    dataset_name: str = Field(..., description="Dataset name: 'spider' or 'bird'")
+    dataset_name: str = Field(..., description="Dataset name: 'spider', 'bird', or 'spider2'")
     db_id: str = Field(..., description="Database ID (folder name)")
     sql: str = Field(..., description="Single SQL statement.")
     mode: str = Field(
@@ -58,13 +59,32 @@ class ExecuteResponse(BaseModel):
 # -----------------------------
 # Helpers
 # -----------------------------
+def reverse_map_db_name(mapped_db_name: str) -> str:
+    """Reverse map database names from mapped names back to original names for SQLite files."""
+    reverse_mappings = {
+        "SQLITE_SAKILA": "sqlite-sakila",
+        "DB_IMDB": "Db-IMDB",
+    }
+    return reverse_mappings.get(mapped_db_name, mapped_db_name)
+
+
 def db_path_safe(dataset_name: str, db_id: str) -> Path:
-    if dataset_name not in ["spider", "bird"]:
-        raise HTTPException(400, detail="dataset_name must be 'spider' or 'bird'")
+    if dataset_name not in ["spider", "bird", "spider2"]:
+        raise HTTPException(400, detail="dataset_name must be 'spider', 'bird', or 'spider2'")
 
     if dataset_name == "spider":
         root = Path(SPIDER_DB_ROOT)
-    else:
+        db_folder = root / db_id
+        db_file = db_folder / f"{db_id}.sqlite"
+    elif dataset_name == "spider2":
+        root = Path(SPIDER2_DB_ROOT)
+        # For spider2, databases are directly in the root directory (not in subdirectories)
+        # Try mapped name first, then original db_id
+        original_db_name = reverse_map_db_name(db_id)
+        db_file = root / f"{original_db_name}.sqlite"
+        if not db_file.exists():
+            db_file = root / f"{db_id}.sqlite"
+    else:  # bird
         train_root = Path(BIRD_TRAIN_DB_ROOT)
         dev_root = Path(BIRD_DEV_DB_ROOT)
         if (train_root / db_id / f"{db_id}.sqlite").exists():
@@ -73,9 +93,9 @@ def db_path_safe(dataset_name: str, db_id: str) -> Path:
             root = dev_root
         else:
             raise HTTPException(404, detail=f"Database not found: {dataset_name}/{db_id}")
+        db_folder = root / db_id
+        db_file = db_folder / f"{db_id}.sqlite"
 
-    db_folder = root / db_id
-    db_file = db_folder / f"{db_id}.sqlite"
     if not db_file.exists():
         raise HTTPException(404, detail=f"Database not found: {dataset_name}/{db_id}")
 

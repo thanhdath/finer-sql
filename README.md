@@ -37,3 +37,11 @@ This helps solving the sparse reward issue of reinforcement learning in Text-to-
 
 ![Visitors](https://margherita-gustatory-zane.ngrok-free.dev/badge/thanhdath%2Ffiner-sql.svg?ngrok-skip-browser-warning=true)
 
+## Setup environment
+
+```
+conda create -n finer-sql python=3.10
+conda activate finer-sql
+pip install -r requirements.txt
+pip install flash-attn==2.6.3 --no-build-isolation
+```
