@@ -15,4 +15,11 @@ It combines:
 
 ---
 
-**We are cleaning and updating the code for easy to use.**
+## Setup environment
+
+```
+conda create -n finer-sql python=3.10
+conda activate finer-sql
+pip install -r requirements.txt
+pip install flash-attn==2.6.3 --no-build-isolation
+```
