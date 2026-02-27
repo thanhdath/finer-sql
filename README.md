@@ -1,3 +1,5 @@
+![visitors](https://visitor-badge.laobi.icu/badge?page_id=thanhdath.finer-sql)
+
 # FINER-SQL: Boosting Small Language Models for Text-to-SQL with Fine-Grained Execution Feedback and Cost-Efficient Rewards
 
 **Models:** 👉 [https://huggingface.co/collections/griffith-bigdata/finer-sql](https://huggingface.co/collections/griffith-bigdata/finer-sql)
@@ -17,3 +19,10 @@ This helps solving the sparse reward issue of reinforcement learning in Text-to-
 ---
 
 **We are cleaning and updating the code for easy to use.**
+
+
+-----------
+**Backup Statistics**
+
+![Visitors](https://margherita-gustatory-zane.ngrok-free.dev/badge/thanhdath%2Ffiner-sql.svg?ngrok-skip-browser-warning=true)
+
