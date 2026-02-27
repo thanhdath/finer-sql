@@ -4,6 +4,18 @@
 
 **Models:** 👉 [https://huggingface.co/collections/griffith-bigdata/finer-sql](https://huggingface.co/collections/griffith-bigdata/finer-sql)
 
+## Citation
+
+```
+@inproceedings{finersql,
+  author       = {Thanh Dat Hoang and Thanh Trung Huynh and Matthias Weidlich and Thanh Tam Nguyen and Tong Chen and Hongzhi Yin and Quoc Viet Hung Nguyen},
+  title        = {Boosting Small Language Models for Text-to-SQL with Fine-Grained Execution Feedback and Cost-Efficient Rewards},
+  booktitle    = {ICDE},
+  publisher    = {IEEE},
+  year         = {2026},
+}
+```
+
 ---
 
 FINER-SQL introduces **dense, interpretable rewards** to train **small language models (≤3B)** for Text-to-SQL via **Group Relative Policy Optimization (GRPO)**.  
