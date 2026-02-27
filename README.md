@@ -45,3 +45,11 @@ conda activate finer-sql
 pip install -r requirements.txt
 pip install flash-attn==2.6.3 --no-build-isolation
 ```
+**We are cleaning and updating the code for easy to use.**
+
+
+-----------
+**Backup Statistics**
+
+![Visitors](https://margherita-gustatory-zane.ngrok-free.dev/badge/thanhdath%2Ffiner-sql.svg?ngrok-skip-browser-warning=true)
+
