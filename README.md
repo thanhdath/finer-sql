@@ -4,8 +4,7 @@
 
 **Models:** 👉 [https://huggingface.co/collections/griffith-bigdata/finer-sql](https://huggingface.co/collections/griffith-bigdata/finer-sql)
 
-## Citation
-
+### Citation
 ```
 @inproceedings{finersql,
   author       = {Thanh Dat Hoang and Thanh Trung Huynh and Matthias Weidlich and Thanh Tam Nguyen and Tong Chen and Hongzhi Yin and Quoc Viet Hung Nguyen},
