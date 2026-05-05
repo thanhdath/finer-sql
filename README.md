@@ -35,11 +35,6 @@ This helps solving the sparse reward issue of reinforcement learning in Text-to-
 ✅ Achieves 67.5% EX on BIRD when training only on BIRD train, and 85% EX on Spider using only a 3B model.  
 ⚡ Runs efficiently on a single 12-24 GB GPU.
 
----
-
-**We are cleaning and updating the code for easy to use.**
-
-
 -----------
 **Backup Statistics**
 
@@ -53,13 +48,6 @@ conda activate finer-sql
 pip install -r requirements.txt
 pip install flash-attn==2.6.3 --no-build-isolation
 ```
-**We are cleaning and updating the code for easy to use.**
-
-
------------
-**Backup Statistics**
-
-![Visitors](https://margherita-gustatory-zane.ngrok-free.dev/badge/thanhdath%2Ffiner-sql.svg?ngrok-skip-browser-warning=true)
 
 
 ## Experiment Results
