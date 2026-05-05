@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# evaluate_bird_dev.py - Evaluation script for BIRD dev dataset
+# evaluate_bird_dev.py – Evaluation script for BIRD dev dataset
 
 from __future__ import annotations
 import os
@@ -11,10 +10,12 @@ import json
 import multiprocessing
 import random
 import time
+import glob
 from datetime import timedelta
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
+from collections import defaultdict
 
 # Set multiprocessing start method before importing vLLM
 multiprocessing.set_start_method('spawn', force=True)
@@ -22,8 +23,6 @@ multiprocessing.set_start_method('spawn', force=True)
 # Ensure vLLM uses spawn multiprocessing and unbuffered logs by default
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
-# v1 engine + shared GPU: huge default max_len blows KV budget; v0 is more predictable on sm75.
-os.environ.setdefault("VLLM_USE_V1", "0")
 
 import pandas as pd
 from datasets import load_from_disk
@@ -47,8 +46,8 @@ def extract_sql_from_completion(text: str) -> Optional[str]:
 
 
 # Minimal SQL API utilities (inlined to avoid importing training code)
-# API_URL = "http://192.168.1.108:8001/execute"
-API_URL = "http://localhost:8001/execute"  # Points to local SQL API on gf-henry
+API_URL = "http://192.168.1.108:8001/execute"
+# API_URL = "http://localhost:8101/execute"
 
 TIMEOUT_MS_DEFAULT = 60000
 MAX_ROWS_DEFAULT = 10000
@@ -88,7 +87,6 @@ def call_sql_api(dataset_name: str, db_id: str, sql: str, *, mode: Optional[str]
                 "timed_out": False,
             }
         data = resp.json()
-        print(str(data.get("pandas_result"))[:300])
         return {
             "ok": bool(data.get("ok", False)),
             "statement_type": data.get("statement_type"),
@@ -132,6 +130,188 @@ def dataframes_equal(true_df: Optional[pd.DataFrame], pred_df: Optional[pd.DataF
     return true_set == pred_set
 
 
+# Majority voting utilities
+def _rows_to_value_tuples_agnostic(rows: Optional[List[Dict[str, Any]]]) -> Optional[List[tuple]]:
+    """Convert rows to header-agnostic tuples of values (pure Python).
+    - Ignores column names; uses only values per row
+    - Sorts values within each row to avoid dependence on column order
+    """
+    if rows is None or not isinstance(rows, list):
+        return None
+    normalized_rows: List[tuple] = []
+    for row in rows:
+        if isinstance(row, dict):
+            values = ["" if v is None else v for v in row.values()]
+            values_sorted = sorted(map(lambda x: str(x), values))
+            normalized_rows.append(tuple(values_sorted))
+    return normalized_rows
+
+
+def is_syntax_error(result: Dict[str, Any]) -> bool:
+    """Check if the execution result indicates a syntax error.
+    All SQL execution failures are considered syntax errors, except infrastructure errors.
+    """
+    if not result.get("ok", False):
+        error = result.get("error", "").lower()
+        # Infrastructure errors that should NOT be considered syntax errors
+        infrastructure_error_indicators = [
+            "timeout",
+            "network",
+            "http",
+            "request",
+            "api",
+            "server",
+            "service unavailable",
+            "timed out",
+            "connection refused",
+            "connection timeout"
+        ]
+        # Database connection errors (not SQL syntax errors)
+        database_connection_errors = [
+            "connection refused",
+            "connection timeout",
+            "database connection",
+            "connection pool"
+        ]
+        # If it's an infrastructure error, don't count as syntax error
+        if any(indicator in error for indicator in infrastructure_error_indicators):
+            return False
+        # If it's a database connection error (not SQL syntax), don't count as syntax error
+        if any(indicator in error for indicator in database_connection_errors):
+            return False
+        # All other SQL execution failures are syntax errors (including "no such table", "no such column", etc.)
+        return True
+    return False
+
+
+def normalize_execution_result(result: Dict[str, Any]) -> str:
+    """Normalize execution result to a header-agnostic signature for grouping via NumPy values.
+    - Failures: error prefix
+    - Successes: signature from per-row sorted values (ignores headers and column order)
+    """
+    if not result.get("ok", False):
+        error = result.get("error", "Unknown error")
+        return f"ERROR: {error[:100]}"
+
+    vals = _rows_to_value_tuples_agnostic(result.get("rows"))
+    if vals is None:
+        row_count = result.get("row_count", 0)
+        return f"SUCCESS_ROWS_COUNT:{row_count}"
+    row_strings = ["|".join(map(str, row)) for row in vals]
+    signature = ";".join(sorted(set(row_strings)))
+    return f"SUCCESS_VALUES:{signature[:200]}"
+
+
+def choose_group_vav(groups: Dict[str, Dict[str, Any]]) -> str:
+    """
+    Size-only voting with hard skip:
+      - Chỉ xét các nhóm SUCCESS_VALUES:...
+      - BỎ HẲN (skip) nhóm rỗng và nhóm toàn số 0 (không cộng/trừ điểm)
+      - Chọn nhóm còn lại có size lớn nhất; tie-break theo key
+      - Nếu sau lọc hết sạch, fallback về nhóm SUCCESS_VALUES lớn nhất, else 'NO_RESULTS'
+    """
+    if not groups:
+        return "NO_RESULTS"
+
+    def parse_vals(key: str):
+        pfx = "SUCCESS_VALUES:"
+        if not key.startswith(pfx):
+            return []
+        s = key[len(pfx):]
+        if s == "":
+            return []
+        return [t.strip() for t in s.split(";") if t.strip() != ""]
+
+    num_re = re.compile(r"^[\s\-+]?(\d+(\.\d+)?)$")
+    def to_num(tok: str):
+        # bỏ dấu % nếu có, chỉ để kiểm tra số 0/0.0
+        t = tok[:-1].strip() if isinstance(tok, str) and tok.strip().endswith("%") else tok
+        if not isinstance(t, str):
+            t = str(t)
+        m = num_re.match(t)
+        return float(m.group(1)) if m else None
+
+    def non_empty_count(vals):
+        return sum(1 for v in vals if v != "")
+
+    def is_empty(vals):
+        return non_empty_count(vals) == 0
+
+    def is_all_zero(vals):
+        nums = [to_num(v) for v in vals if v != ""]
+        nums = [x for x in nums if x is not None]
+        return len(nums) > 0 and all(abs(x) < 1e-12 for x in nums)
+
+    # 1) Lọc chỉ còn SUCCESS_VALUES
+    sv_items = [(k, meta) for k, meta in groups.items() if k.startswith("SUCCESS_VALUES:")]
+
+    # 2) Skip hẳn nhóm rỗng hoặc toàn 0
+    filtered = []
+    for k, meta in sv_items:
+        vals = parse_vals(k)
+        if is_empty(vals):
+            continue
+        if is_all_zero(vals):
+            continue
+        filtered.append((k, meta))
+
+    # 3) Nếu còn ứng viên, chọn theo size lớn nhất; tie-break by key
+    if filtered:
+        best_key = max(filtered, key=lambda km: (int(km[1].get("size", 0)), km[0]))[0]
+        return best_key
+
+    # 4) Fallback: nếu lọc hết, chọn nhóm SUCCESS_VALUES lớn nhất ban đầu
+    if sv_items:
+        return max(sv_items, key=lambda km: (int(km[1].get("size", 0)), km[0]))[0]
+
+    # 5) Không có SUCCESS_VALUES nào
+    return "NO_RESULTS"
+
+
+# Ground truth execution results loading
+GT_EXEC_RESULT_DIR = "/home/datht/Spider2/spider2-lite/evaluation_suite/gold/exec_result/"
+
+def load_gt_execution_results(instance_id: str) -> List[Optional[pd.DataFrame]]:
+    """Load all ground truth execution results for an instance_id.
+    
+    Returns a list of DataFrames, one for each variant (_a, _b, _c, etc. or no suffix).
+    Returns empty list if no ground truth results found.
+    
+    Logic:
+    - If a file without suffix exists (e.g., bq051.csv), return only that
+    - Otherwise, collect all files with suffix _a, _b, _c, etc.
+    """
+    gt_results: List[Optional[pd.DataFrame]] = []
+    base_path = Path(GT_EXEC_RESULT_DIR)
+    
+    # First check if there's a file without suffix
+    csv_path_no_suffix = base_path / f"{instance_id}.csv"
+    if csv_path_no_suffix.exists():
+        try:
+            df = pd.read_csv(csv_path_no_suffix)
+            gt_results.append(df.fillna(""))
+        except Exception as e:
+            print(f"Warning: Failed to load {csv_path_no_suffix}: {e}")
+            gt_results.append(None)
+        # If file without suffix exists, return only that (single correct answer)
+        return gt_results
+    
+    # Otherwise, look for files with suffix _a, _b, _c, etc. using glob
+    pattern = str(base_path / f"{instance_id}_*.csv")
+    matching_files = sorted(glob.glob(pattern))
+    
+    for csv_path_str in matching_files:
+        csv_path = Path(csv_path_str)
+        try:
+            df = pd.read_csv(csv_path)
+            gt_results.append(df.fillna(""))
+        except Exception as e:
+            print(f"Warning: Failed to load {csv_path}: {e}")
+            gt_results.append(None)
+    
+    return gt_results
+
+
 # Worker utilities for parallel per-sample execution
 def _normalize_sql_static(sql: str) -> str:
     s = sql.strip()
@@ -149,9 +329,10 @@ def _init_worker(preloaded_cache: Dict[Tuple[str, str, str], Dict[str, Any]]):
 
 
 def _evaluate_sample_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Execute one sample's GT and candidate SQLs with intra-sample dedup."""
+    """Execute one sample's candidate SQLs with intra-sample dedup and recall checking against ground truth execution results."""
     dataset_name = entry["dataset_name"]
     db_id = entry["db_id"]
+    instance_id = entry.get("instance_id", "")
     predicted_sqls: List[str] = entry.get("predicted_sqls", [])
     full_completions = entry.get("full_completions", [])
     local_exec_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -180,16 +361,12 @@ def _evaluate_sample_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[
         local_exec_cache[key] = res
         return res
 
-    # Execute GT once
-    gt_res = exec_with_local_cache(entry["ground_truth_sql"])
-    gt_ok = gt_res.get("ok", False)
-    gt_df = None
-    if gt_ok:
-        try:
-            gt_df = _rows_to_dataframe(gt_res.get("rows"))
-        except Exception:
-            gt_ok = False
+    # Load ground truth execution results
+    gt_exec_results: List[Optional[pd.DataFrame]] = []
+    if instance_id:
+        gt_exec_results = load_gt_execution_results(instance_id)
 
+    # Execute candidates and check against ground truth execution results
     any_correct = False
     first_correct_index = -1
     candidate_exec_results: List[Optional[Dict[str, Any]]] = [None] * len(predicted_sqls)
@@ -209,12 +386,18 @@ def _evaluate_sample_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[
         try:
             pred_res = exec_with_local_cache(candidate_sql)
             candidate_exec_results[idx] = pred_res
-            if gt_ok and pred_res.get("ok", False):
+            
+            # Check if this candidate matches any ground truth execution result
+            if pred_res.get("ok", False) and gt_exec_results:
                 pred_df = _rows_to_dataframe(pred_res.get("rows"))
-                if dataframes_equal(gt_df, pred_df):
-                    any_correct = True
-                    if first_correct_index == -1:
-                        first_correct_index = idx
+                if pred_df is not None:
+                    # Compare against all ground truth results
+                    for gt_df in gt_exec_results:
+                        if gt_df is not None and dataframes_equal(gt_df, pred_df):
+                            any_correct = True
+                            if first_correct_index == -1:
+                                first_correct_index = idx
+                            break
         except Exception:
             candidate_exec_results[idx] = {
                 "ok": False,
@@ -229,19 +412,21 @@ def _evaluate_sample_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[
 
     result = {
         "sample_id": entry["sample_id"],
+        "instance_id": instance_id,
         "dataset_name": dataset_name,
         "db_id": db_id,
         "question": entry.get("question", ""),
-        "ground_truth_sql": entry["ground_truth_sql"],
+        "ground_truth_sql": entry.get("ground_truth_sql", ""),
         "predicted_sqls": predicted_sqls,
         "full_completions": full_completions,
+        "num_candidates": len(predicted_sqls),
         "any_execution_correct": any_correct,
         "first_correct_index": first_correct_index,
-        "num_candidates": len(predicted_sqls),
+        "num_gt_exec_results": len(gt_exec_results),
     }
     result_with_exec = dict(result)
-    result_with_exec["gt_execution_result"] = gt_res
     result_with_exec["candidate_execution_results"] = candidate_exec_results
+    result_with_exec["gt_execution_results"] = gt_exec_results
     return result, result_with_exec
 
 def get_config():
@@ -250,8 +435,8 @@ def get_config():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="thanhdath/FINER-SQL-3B-BIRD",
-        help="HF model id or local path to load with vLLM"
+        default="/home/datht/mats/alignment-handbook/output/Qwen-2.5-Coder-1.5B-SQL-Writer",
+        help="Path to the model to load with vLLM"
     )
     parser.add_argument(
         "--data-path",
@@ -318,22 +503,11 @@ def get_config():
         help="Only generate and save predictions; skip executing SQLs"
     )
     parser.add_argument(
-        "--gpu-memory-utilization",
-        type=float,
-        default=0.5,
-        help="vLLM gpu_memory_utilization (0-1 fraction of GPU memory)"
-    )
-    parser.add_argument(
-        "--dtype",
+        "--selection-strategy",
         type=str,
-        default="auto",
-        help="vLLM dtype: auto, bfloat16, float16, float32. Use float16 for GPUs with compute capability < 8.0"
-    )
-    parser.add_argument(
-        "--max-model-len",
-        type=int,
-        default=4096,
-        help="vLLM max_model_len (KV budget). Use 4096 for BIRD+2048 completion; lower if sharing GPU.",
+        choices=["majority", "vav"],
+        default="vav",
+        help="Majority voting selection strategy: 'majority' (simple majority) or 'vav' (value-aware voting)"
     )
 
     args = parser.parse_args()
@@ -351,9 +525,7 @@ def get_config():
         "seed": int(args.seed),
         "skip_executing": bool(args.skip_executing),
         "update_cache": bool(args.update_cache),
-        "gpu_memory_utilization": float(args.gpu_memory_utilization),
-        "dtype": args.dtype,
-        "max_model_len": int(args.max_model_len),
+        "selection_strategy": args.selection_strategy,
     }
 
 
@@ -404,7 +576,7 @@ class BIRDEvaluator:
             ds = "bird" if "bird" in dp else ("spider" if "spider" in dp else None)
             sp = "train" if "train" in dp else ("dev" if "dev" in dp else None)
             if ds and sp:
-                self.exec_cache_file = os.path.join(config['output_dir'], f"execution_cache_{ds}_{sp}.pkl")
+                self.exec_cache_file = os.path.join("/home/datht/mats/sql_writer/evaluation", f"execution_cache_{ds}_{sp}.pkl")
             else:
                 self.exec_cache_file = os.path.join(config['output_dir'], "execution_cache.pkl")
         self.exec_cache: Dict[tuple, Dict[str, Any]] = {}
@@ -427,32 +599,16 @@ class BIRDEvaluator:
         """Setup vLLM for inference."""
         from vllm import LLM, SamplingParams
         self.vllm_model_path = self.config['model_path']
-        dtype = self.config.get("dtype", "auto")
-        if dtype == "auto":
-            # Auto-detect: bfloat16 needs compute capability >= 8.0
-            if torch.cuda.is_available():
-                cc = torch.cuda.get_device_capability()
-                dtype = "bfloat16" if cc[0] >= 8 else "float16"
-            else:
-                dtype = "float32"
-        import os as _os
-        # vLLM 0.12.0 v1 engine uses torch.compile with CUDA graphs by default.
-        # On TITAN RTX (compute 7.5, 24GB) the CUDA graph capture OOMs during warmup
-        # because torch.compile pre-allocates for all 51 batch sizes.
-        # Force v0 engine to get simple eager-mode execution.
-        _os.environ["VLLM_USE_V1"] = "0"
         self.llm = LLM(
             model=self.vllm_model_path,
-            dtype=dtype,
+            dtype="bfloat16" if torch.cuda.is_available() else "float32",
             trust_remote_code=True,
             tensor_parallel_size=1,
-            max_model_len=int(self.config.get("max_model_len", 4096)),
-            gpu_memory_utilization=float(self.config.get("gpu_memory_utilization", 0.5)),
-            enforce_eager=True,  # skip CUDA graph capture to save memory
+            gpu_memory_utilization=0.9
         )
         self.sampling_params = SamplingParams(
             temperature=float(self.config.get("temperature", 1.0)),
-            max_tokens=2048,
+            max_tokens=8192,
             stop=["<|endoftext|>"],
             n=int(self.config.get("num_samples", 1)),
             seed=int(self.config.get("seed", 42)),
@@ -481,7 +637,7 @@ class BIRDEvaluator:
         
         return completions_per_prompt
     
-
+    
     
     def analyze_sql_quality(self, predicted_sql: str, ground_truth_sql: str, dataset_name: str, db_id: str) -> Dict[str, Any]:
         """Analyze the quality of generated SQL using API execution."""
@@ -581,6 +737,8 @@ class BIRDEvaluator:
 # """
                 prompt = self.tokenizer.apply_chat_template(sample_dict["messages"], tokenize=False, add_generation_prompt=True)
                 prompts.append(prompt)
+                print("--------------------------------")
+                print(prompt)
             
             # Generate SQL
             print("Generating SQL predictions (multi-sample)...")
@@ -603,6 +761,7 @@ class BIRDEvaluator:
                     "dataset_name": sample_dict["dataset_name"],
                     "db_id": sample_dict["db_id"],
                     "question": sample_dict["question"],
+                    "instance_id": sample_dict["instance_id"],
                     "ground_truth_sql": sample_dict["groundtruth_sqls"][0],
                     "predicted_sqls": predicted_sqls_per_prompt[i],
                     "full_completions": completions_per_prompt[i],
@@ -656,6 +815,15 @@ class BIRDEvaluator:
         except Exception as e:
             print(f"Failed to ingest execution results into cache: {e}")
 
+        # Apply majority voting to select final SQL for each sample
+        print("Applying majority voting to select final SQL...")
+        selection_strategy = self.config.get("selection_strategy", "vav")
+        for entry in tqdm(results_with_exec, desc="Majority voting"):
+            self.majority_voting_for_sample(entry, selection_strategy=selection_strategy)
+
+        # Save per-sample files in ReFoRCE format
+        self._save_per_sample_files(results_with_exec)
+
         # Compute metrics
         metrics = self._compute_metrics(results)
         
@@ -671,11 +839,12 @@ class BIRDEvaluator:
         except Exception as e:
             print(f"Failed to save detailed results PKL to {detailed_pkl}: {e}")
         
-        # Always persist execution cache to disk for reuse across evaluations
-        try:
-            self.save_execution_cache()
-        except Exception as e:
-            print(f"Failed to save execution cache to {self.exec_cache_file}: {e}")
+        # Persist execution cache to disk if updating is enabled or n==30
+        if self.config.get("update_cache", False) or int(self.config.get("num_samples", 0)) >= 30:
+            try:
+                self.save_execution_cache()
+            except Exception as e:
+                print(f"Failed to save execution cache to {self.exec_cache_file}: {e}")
         
         return metrics
 
@@ -685,6 +854,105 @@ class BIRDEvaluator:
         s = re.sub(r";+\s*$", "", s)
         s = re.sub(r"\s+", " ", s)
         return s
+    
+    def majority_voting_for_sample(self, entry: Dict[str, Any], selection_strategy: str = "vav") -> Dict[str, Any]:
+        """Perform majority voting for a single sample to select the best SQL candidate.
+        
+        Args:
+            entry: Sample entry with predicted_sqls and candidate_execution_results
+            selection_strategy: "vav" (value-aware voting) or "majority" (simple majority)
+        
+        Returns:
+            Updated entry with majority_voted_sql, majority_voted_index, and voting metadata
+        """
+        predicted_sqls = entry.get("predicted_sqls", [])
+        candidate_exec_results = entry.get("candidate_execution_results", [])
+        
+        # Build pred_results list
+        pred_results = []
+        for idx, sql in enumerate(predicted_sqls):
+            if idx < len(candidate_exec_results):
+                result = candidate_exec_results[idx]
+            else:
+                result = {"ok": False, "error": "No execution result"}
+            pred_results.append({"sql": sql, "result": result, "index": idx})
+        
+        # Filter out syntax errors and group predicted SQLs by execution result
+        valid_pred_results = []
+        syntax_error_count = 0
+        infrastructure_failures: List[Dict[str, Any]] = []
+        
+        for pred in pred_results:
+            if is_syntax_error(pred["result"]):
+                syntax_error_count += 1
+            else:
+                # non-syntax: either ok or failed for infrastructure reasons
+                valid_pred_results.append(pred)
+                if not pred["result"].get("ok", False):
+                    infrastructure_failures.append(pred)
+        
+        # Group valid predicted SQLs by execution result (only successful executions)
+        result_groups = defaultdict(list)
+        for pred in valid_pred_results:
+            # Only group successful executions, not errors
+            if pred["result"].get("ok", False):
+                normalized_result = normalize_execution_result(pred["result"])
+                result_groups[normalized_result].append(pred)
+        
+        # Sort groups by size (descending)
+        sorted_groups = sorted(result_groups.items(), key=lambda kv: len(kv[1]), reverse=True)
+        
+        # Find majority group (group with most SQLs)
+        if not sorted_groups:
+            majority_group = []
+            majority_result = "NO_RESULTS"
+        else:
+            majority_result, majority_group = sorted_groups[0]
+        
+        # Decide selection strategy and choose group
+        strategy = selection_strategy.lower()
+        chosen_group_items: List[Dict[str, Any]] = []
+        if strategy == "majority":
+            chosen_group_items = majority_group
+        else:
+            # Use VAV (value-aware voting)
+            groups_meta = {}
+            for res_key, items in sorted_groups:
+                groups_meta[res_key] = {
+                    "size": len(items),
+                    "is_majority": (res_key == majority_result),
+                    "sqls": [{"index": item["index"], "sql": item["sql"]} for item in items],
+                }
+            vav_result_key = choose_group_vav(groups_meta)
+            chosen_group_items = result_groups.get(vav_result_key, [])
+        
+        # Select one SQL from the chosen group (first one)
+        if chosen_group_items:
+            selected_sql = chosen_group_items[0]["sql"]
+            selected_index = chosen_group_items[0]["index"]
+            selected_result = chosen_group_items[0]["result"]
+        else:
+            # Fallback to first candidate if no valid group found
+            if predicted_sqls:
+                selected_sql = predicted_sqls[0]
+                selected_index = 0
+                selected_result = candidate_exec_results[0] if candidate_exec_results else {"ok": False, "error": "No execution result"}
+            else:
+                selected_sql = ""
+                selected_index = -1
+                selected_result = {"ok": False, "error": "No valid SQLs"}
+        
+        # Update entry with majority voting results
+        entry["majority_voted_sql"] = selected_sql
+        entry["majority_voted_index"] = selected_index
+        entry["majority_voted_result"] = selected_result
+        entry["majority_result_key"] = majority_result if sorted_groups else "NO_RESULTS"
+        entry["num_result_groups"] = len(result_groups)
+        entry["majority_group_size"] = len(majority_group)
+        entry["num_syntax_errors"] = syntax_error_count
+        entry["num_infrastructure_failures"] = len(infrastructure_failures)
+        
+        return entry
 
     def _exec_with_cache(self, dataset_name: str, db_id: str, sql: str, *, mode: Optional[str] = None, timeout_ms: Optional[int] = None, max_rows: Optional[int] = None) -> Dict[str, Any]:
         """Execute SQL with in-memory cache keyed by (dataset, db, normalized SQL)."""
@@ -720,23 +988,7 @@ class BIRDEvaluator:
                 dataset_name = entry.get("dataset_name", "")
                 db_id = entry.get("db_id", "")
 
-                # Ground-truth SQL result
-                gt_sql = entry.get("ground_truth_sql", "")
-                gt_res = entry.get("gt_execution_result")
-                if (
-                    dataset_name
-                    and db_id
-                    and gt_sql
-                    and isinstance(gt_res, dict)
-                    and gt_res.get("ok", False)
-                    and not gt_res.get("timed_out", False)
-                ):
-                    key_gt = (dataset_name, db_id, self._normalize_sql(gt_sql))
-                    if key_gt not in self.exec_cache:
-                        self.exec_cache[key_gt] = gt_res
-                        added_count += 1
-
-                # Candidate SQL results
+                # Candidate SQL results only (no ground truth execution)
                 cand_sqls = entry.get("predicted_sqls", []) or []
                 cand_results = entry.get("candidate_execution_results", []) or []
                 for cand_sql, cand_res in zip(cand_sqls, cand_results):
@@ -810,24 +1062,155 @@ class BIRDEvaluator:
         """Compute evaluation metrics."""
         total_samples = len(results)
         
-        # Metrics for multi-candidate recall@N
+        # Metrics for SQL generation and execution
         has_any_sql_count = sum(1 for r in results if any((s or "").strip() for s in r.get("predicted_sqls", [])))
-        execution_recall_count = sum(1 for r in results if r.get("any_execution_correct", False))
+        has_majority_voted_sql_count = sum(1 for r in results if r.get("majority_voted_sql", "").strip())
         
-        # Failed samples are those with no correct candidate
+        # Execution success metrics
+        total_syntax_errors = sum(r.get("num_syntax_errors", 0) for r in results)
+        total_infrastructure_failures = sum(r.get("num_infrastructure_failures", 0) for r in results)
+        
+        # Count samples with successful majority-voted SQL execution
+        successful_execution_count = sum(
+            1 for r in results 
+            if r.get("majority_voted_result", {}).get("ok", False)
+        )
+        
+        # Recall metrics (execution correctness against ground truth)
+        execution_recall_count = sum(1 for r in results if r.get("any_execution_correct", False))
+        execution_recall_rate = execution_recall_count / total_samples if total_samples else 0.0
+        
+        # Failed samples (no correct candidate)
         failed_samples = [r for r in results if not r.get("any_execution_correct", False)]
-        failed_sample_ids = [r["sample_id"] for r in failed_samples]
+        failed_sample_ids = [r.get("instance_id", r.get("sample_id", "")) for r in failed_samples]
         
         metrics = {
             "total_samples": total_samples,
             "has_any_sql_rate": has_any_sql_count / total_samples if total_samples else 0.0,
-            "execution_recall_at_n": execution_recall_count / total_samples if total_samples else 0.0,
+            "has_majority_voted_sql_rate": has_majority_voted_sql_count / total_samples if total_samples else 0.0,
+            "successful_execution_rate": successful_execution_count / total_samples if total_samples else 0.0,
+            "execution_recall_at_n": execution_recall_rate,
+            "execution_recall_count": execution_recall_count,
+            "total_syntax_errors": total_syntax_errors,
+            "total_infrastructure_failures": total_infrastructure_failures,
             "failed_samples": failed_samples,
-            "failed_sample_ids": failed_sample_ids
+            "failed_sample_ids": failed_sample_ids,
         }
         
         return metrics
     
+    def _save_per_sample_files(self, results_with_exec: List[Dict[str, Any]]):
+        """Save per-sample files in ReFoRCE format: instance_id/log.log, result.sql, result.csv
+        Also saves execution results to execution_result/ directory."""
+        output_dir = Path(self.config['output_dir'])
+        
+        # Create execution_result directory
+        execution_result_dir = output_dir / "execution_result"
+        execution_result_dir.mkdir(parents=True, exist_ok=True)
+        
+        for entry in results_with_exec:
+            # Get instance_id (use sample_id if available, otherwise generate from db_id and sample_id)
+            sample_id = entry.get("sample_id")
+            db_id = entry.get("db_id", "")
+            instance_id = entry["instance_id"]
+            
+            # Create directory for this instance
+            instance_dir = output_dir / instance_id
+            instance_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Use majority-voted SQL
+            final_sql = entry.get("majority_voted_sql", "")
+            final_exec_result = entry.get("majority_voted_result")
+            majority_voted_index = entry.get("majority_voted_index", -1)
+            
+            # Save result.sql
+            sql_file = instance_dir / "result.sql"
+            with open(sql_file, "w", encoding="utf-8") as f:
+                f.write(final_sql)
+            
+            # Helper function to write CSV content
+            def write_csv_content(csv_path: Path):
+                """Write CSV content to the given path."""
+                if final_exec_result and final_exec_result.get("ok", False):
+                    rows = final_exec_result.get("rows", [])
+                    if rows:
+                        try:
+                            df = _rows_to_dataframe(rows)
+                            if df is not None:
+                                df.to_csv(csv_path, index=False)
+                            else:
+                                # Empty CSV if no rows
+                                with open(csv_path, "w", encoding="utf-8") as f:
+                                    f.write("")
+                        except Exception as e:
+                            # Write error to CSV if conversion fails
+                            with open(csv_path, "w", encoding="utf-8") as f:
+                                f.write(f"Error: {str(e)}")
+                    else:
+                        # Empty CSV if no rows
+                        with open(csv_path, "w", encoding="utf-8") as f:
+                            f.write("")
+                else:
+                    # Write error message to CSV if execution failed
+                    error_msg = final_exec_result.get("error", "Execution failed") if final_exec_result else "No execution result"
+                    with open(csv_path, "w", encoding="utf-8") as f:
+                        f.write(f"Error: {error_msg}")
+            
+            # Save result.csv (execution result in CSV format) in per-sample directory
+            csv_file = instance_dir / "result.csv"
+            write_csv_content(csv_file)
+            
+            # Save execution result CSV in execution_result directory
+            execution_csv_file = execution_result_dir / f"{instance_id}.csv"
+            write_csv_content(execution_csv_file)
+             
+            # Save log.log
+            log_file = instance_dir / "log.log"
+            predicted_sqls = entry.get("predicted_sqls", [])
+            candidate_exec_results = entry.get("candidate_execution_results", [])
+            with open(log_file, "w", encoding="utf-8") as f:
+                f.write(f"Instance ID: {instance_id}\n")
+                f.write(f"Sample ID: {sample_id}\n")
+                f.write(f"Database ID: {db_id}\n")
+                f.write(f"Question: {entry.get('question', '')}\n")
+                f.write(f"\n{'='*50}\n")
+                if entry.get('ground_truth_sql'):
+                    f.write(f"Ground Truth SQL:\n{entry.get('ground_truth_sql', '')}\n")
+                    f.write(f"\n{'='*50}\n")
+                f.write(f"Number of candidates: {len(predicted_sqls)}\n")
+                f.write(f"Majority voted index: {majority_voted_index}\n")
+                f.write(f"Majority result key: {entry.get('majority_result_key', 'N/A')}\n")
+                f.write(f"Number of result groups: {entry.get('num_result_groups', 0)}\n")
+                f.write(f"Majority group size: {entry.get('majority_group_size', 0)}\n")
+                f.write(f"Syntax errors: {entry.get('num_syntax_errors', 0)}\n")
+                f.write(f"Infrastructure failures: {entry.get('num_infrastructure_failures', 0)}\n")
+                f.write(f"\n{'='*50}\n")
+                f.write(f"Final SQL (majority-voted, candidate {majority_voted_index}):\n{final_sql}\n")
+                f.write(f"\n{'='*50}\n")
+                f.write(f"Execution Result:\n")
+                if final_exec_result:
+                    f.write(f"  OK: {final_exec_result.get('ok', False)}\n")
+                    f.write(f"  Row count: {final_exec_result.get('row_count', 0)}\n")
+                    if final_exec_result.get('error'):
+                        f.write(f"  Error: {final_exec_result.get('error')}\n")
+                    if final_exec_result.get('pandas_result'):
+                        f.write(f"  Result:\n{final_exec_result.get('pandas_result')}\n")
+                else:
+                    f.write("  No execution result\n")
+                f.write(f"\n{'='*50}\n")
+                f.write(f"All Candidates:\n")
+                for idx, (sql, exec_res) in enumerate(zip(predicted_sqls, candidate_exec_results)):
+                    f.write(f"\n--- Candidate {idx} ---\n")
+                    f.write(f"SQL: {sql}\n")
+                    if exec_res:
+                        f.write(f"Execution OK: {exec_res.get('ok', False)}\n")
+                        if exec_res.get('error'):
+                            f.write(f"Error: {exec_res.get('error')}\n")
+                        f.write(f"Row count: {exec_res.get('row_count', 0)}\n")
+        
+        print(f"Saved per-sample files in ReFoRCE format to {output_dir}")
+        print(f"Saved execution result CSV files to {execution_result_dir}")
+
     def _save_results(self, results: List[Dict[str, Any]], metrics: Dict[str, Any]):
         """Save evaluation results to files."""
         # Save detailed results
@@ -852,18 +1235,27 @@ class BIRDEvaluator:
         # Save summary
         summary_file = os.path.join(self.config['output_dir'], "summary.txt")
         with open(summary_file, "w") as f:
-            f.write("BIRD Dev Evaluation Results\n")
+            f.write("Spider2 SQLite Evaluation Results\n")
             f.write("=" * 50 + "\n\n")
             f.write(f"Total samples: {metrics['total_samples']}\n")
             f.write(f"Has any-SQL rate: {metrics['has_any_sql_rate']:.3f}\n")
+            f.write(f"Has majority-voted SQL rate: {metrics['has_majority_voted_sql_rate']:.3f}\n")
+            f.write(f"Successful execution rate: {metrics['successful_execution_rate']:.3f}\n")
             f.write(f"Execution recall@N: {metrics['execution_recall_at_n']:.3f}\n")
+            f.write(f"Execution recall count: {metrics['execution_recall_count']}\n")
+            f.write(f"Total syntax errors: {metrics['total_syntax_errors']}\n")
+            f.write(f"Total infrastructure failures: {metrics['total_infrastructure_failures']}\n")
             f.write(f"Failed sample IDs: {metrics['failed_sample_ids']}\n")
         
         print(f"Results saved to {self.config['output_dir']}")
         print(f"Has any-SQL rate: {metrics['has_any_sql_rate']:.3f}")
+        print(f"Has majority-voted SQL rate: {metrics['has_majority_voted_sql_rate']:.3f}")
+        print(f"Successful execution rate: {metrics['successful_execution_rate']:.3f}")
         print(f"Execution recall@N: {metrics['execution_recall_at_n']:.3f}")
+        print(f"Execution recall count: {metrics['execution_recall_count']}")
+        print(f"Total syntax errors: {metrics['total_syntax_errors']}")
+        print(f"Total infrastructure failures: {metrics['total_infrastructure_failures']}")
         print(f"Failed samples: {len(metrics['failed_sample_ids'])}")
-        print(f"Failed sample IDs: {metrics['failed_sample_ids']}")
 
 
 def main():

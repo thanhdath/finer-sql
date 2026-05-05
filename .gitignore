@@ -1,0 +1,49 @@
+# ── Model checkpoints & training outputs ────────────────────────────────────
+output/
+pack_grpo_bird_0.5b_mv5085/
+# models/ contains only local README docs — do NOT ignore it
+
+# ── Memory / ChromaDB stores ─────────────────────────────────────────────────
+memory/chroma_db*/
+!memory/chroma_db-init/        # keep the empty seed DB for reference
+
+# ── Evaluation logs & intermediate artefacts ────────────────────────────────
+evaluation/*.log
+evaluation/logs/
+evaluation/output/
+evaluation/temp/
+*.log
+ablation_runner.log
+eval_runner.log
+push_datasets.log
+rebuild_gt_cache.log
+# ── Backup / temp files ──────────────────────────────────────────────────────
+README.md.bak
+*.bak
+*.tmp
+
+# ── Local data caches & packed datasets ─────────────────────────────────────
+bird_dev_sds_subset_prompts_v2/
+failed_samples.json
+failed_others.json
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.claude/
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+visualization/
+reasoning_distilation/
+atomic_ops/__pycache__/
+**/__pycache__/
+TODO.md
+models/

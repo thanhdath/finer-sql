@@ -1,0 +1,33 @@
+# Core training + inference
+torch==2.8.0
+transformers==4.57.3
+trl==0.25.1
+accelerate==1.7.0
+vllm==0.10.2
+datasets==4.1.1
+huggingface-hub==0.34.0
+
+# Training extras (referenced by configs/ and the GRPO recipe)
+deepspeed
+peft
+liger-kernel
+
+# SQL parsing / execution
+sqlglot
+pandas
+numpy
+requests
+func-timeout       # BIRD official evaluator
+
+# Memory reward (ChromaDB-backed)
+chromadb
+sentence-transformers
+python-dotenv
+
+# DB execution sandbox API
+fastapi
+uvicorn
+pydantic
+
+# Used by the OpenAI-backed reasoning-trace tools
+openai

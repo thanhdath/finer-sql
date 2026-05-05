@@ -17,7 +17,6 @@ from memory.compute_intrinsic_reward import IntrinsicRewardComputer
 from trl import GRPOConfig, GRPOTrainer  # type: ignore
 import pickle
 import pandas as pd  # type: ignore
-from mcts_grpo import MCTSGRPOTrainer
 from atomic_ops.reward import AtomicOpsReward
 from sql_exec_scorer import SQLExecScorer
 
@@ -35,7 +34,8 @@ _EXEC_SCORER = SQLExecScorer(
     numeric_eps=SCORING_NUMERIC_EPS,
 )
 
-ATOMIC_OPS_REWARD = AtomicOpsReward(dialect="sqlite")
+# Initialized after ARGS is parsed (see below, after ATOMIC_E/BETA/GAMMA are set)
+ATOMIC_OPS_REWARD: Optional[AtomicOpsReward] = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,11 +47,19 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--timeout_ms", type=int, default=60000)
     ap.add_argument("--max_rows", type=int, default=10000)
     ap.add_argument("--max_steps", type=int, default=20000)
+    ap.add_argument("--save_steps", type=int, default=200, help="Save a checkpoint every N steps")
+    ap.add_argument("--save_total_limit", type=int, default=None, help="Max number of checkpoints to keep on disk (oldest deleted first). None = keep all.")
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=32, help="Gradient accumulation steps (global_batch = num_gpus * grad_accum)")
+    ap.add_argument("--learning_rate", type=float, default=8e-6, help="Learning rate for GRPO")
     ap.add_argument("--num_generations", type=int, default=32)
     ap.add_argument("--limit_samples", type=int, default=0, help="0 = all")
     ap.add_argument("--max_completion_length", type=int, default=2048)
     ap.add_argument("--use_vllm", action="store_true")
     ap.add_argument("--vllm_mode", default="server", choices=["server", "colocate"])
+    ap.add_argument("--vllm_server_host", type=str, default="0.0.0.0", help="vLLM server host (server mode)")
+    ap.add_argument("--vllm_server_port", type=int, default=8000, help="vLLM server port (server mode)")
+    ap.add_argument("--use_liger_kernel", action="store_true", help="Use Liger kernel for ~20%% speed and memory savings")
+    ap.add_argument("--vllm-no-sleep", action="store_true", dest="vllm_no_sleep", help="Disable vLLM sleep mode in colocate (faster but needs more GPU headroom)")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--gt_cache", default="/home/htdat/codes/data/gt_rows_cache.pkl", help="Path to pickle of cached GT rows {(dataset, db_id, sql): rows}")
     ap.add_argument("--api_max_wait_time", type=int, default=300, help="Max time to wait for API recovery (seconds)")
@@ -60,12 +68,23 @@ def parse_args() -> argparse.Namespace:
     # Intrinsic reward / memory args
     ap.add_argument("--chroma_path", default="./memory/chroma_db", help="Path to ChromaDB persistent store")
     ap.add_argument("--chroma_collection", default="reasoning_paths", help="Chroma collection name for reasoning paths")
-    ap.add_argument("--intrinsic_top_k", type=int, default=20, help="How many similar reasoning paths to retrieve")
+    ap.add_argument("--intrinsic_top_k", "--memory-top-k", type=int, default=20, dest="intrinsic_top_k", help="How many similar reasoning paths to retrieve")
     ap.add_argument("--intrinsic_use_explore", action="store_true", help="Use exploration term against failed paths if available")
+    ap.add_argument("--same-db-retrieval", action="store_true", help="Allow querying memory on the same db_id (not just other db_ids)")
+    ap.add_argument("--only-same-db-retrieval", action="store_true", help="Only query memory with db_id=this_id (exclude other db_ids)")
     ap.add_argument("--no-memory", action="store_true", help="Disable memory/intrinsic reward")
     ap.add_argument("--no-atomic", action="store_true", help="Disable atomic operations reward")
     ap.add_argument("--filter-empty-gt", action="store_true", help="Filter out training samples with empty ground truth SQL execution results")
-    ap.add_argument("--max_prompt_length", type=int, default=4096, help="Maximum prompt length in tokens")
+    ap.add_argument("--max_prompt_length", type=int, default=2048, help="Maximum prompt length in tokens")
+    # Atomic reward shaping function parameters (S3: e=0.05, beta=0.79, gamma=0.20)
+    ap.add_argument("--atomic-e", type=float, default=0.05, help="Atomic reward shaping: weight on linear term (default: 0.05 for S3)")
+    ap.add_argument("--atomic-beta", type=float, default=0.79, help="Atomic reward shaping: beta coefficient (default: 0.79 for S3)")
+    ap.add_argument("--atomic-gamma", type=float, default=0.20, help="Atomic reward shaping: gamma exponent (default: 0.20 for S3)")
+    # GRPO training stability knobs
+    ap.add_argument("--beta", type=float, default=0.04, help="KL divergence penalty coefficient (default: 0.04). Lower = more exploration, e.g. 0.001 for expert config")
+    ap.add_argument("--warmup_ratio", type=float, default=0.0, help="Fraction of steps to linearly warm up LR from 0 (e.g. 0.03 = 3%% of max_steps)")
+    ap.add_argument("--warmup_steps", type=int, default=0, help="Number of absolute warmup steps (overrides warmup_ratio if >0)")
+    ap.add_argument("--max_grad_norm", type=float, default=1.0, help="Gradient clipping max norm (default: 1.0)")
     return ap.parse_args()
 
 ARGS = parse_args()
@@ -77,6 +96,11 @@ API_URL = ARGS.api_url
 TIMEOUT_MS = ARGS.timeout_ms
 MAX_ROWS = ARGS.max_rows
 MAX_STEPS = ARGS.max_steps
+SAVE_STEPS = ARGS.save_steps
+SAVE_TOTAL_LIMIT = ARGS.save_total_limit
+GRADIENT_ACCUMULATION_STEPS = ARGS.gradient_accumulation_steps
+LEARNING_RATE = ARGS.learning_rate
+USE_LIGER_KERNEL = ARGS.use_liger_kernel
 NUM_GENERATIONS = ARGS.num_generations
 LIMIT_SAMPLES = ARGS.limit_samples
 MAX_COMPLETION_LENGTH = ARGS.max_completion_length
@@ -91,9 +115,16 @@ CHROMA_PATH = ARGS.chroma_path
 CHROMA_COLLECTION = ARGS.chroma_collection
 INTRINSIC_TOP_K = ARGS.intrinsic_top_k
 INTRINSIC_USE_EXPLORE = ARGS.intrinsic_use_explore
+SAME_DB_RETRIEVAL = getattr(ARGS, 'same_db_retrieval', False)
+ONLY_SAME_DB_RETRIEVAL = getattr(ARGS, 'only_same_db_retrieval', False)
 NO_MEMORY = ARGS.no_memory
 NO_ATOMIC = ARGS.no_atomic
 MAX_PROMPT_LEN = ARGS.max_prompt_length
+ATOMIC_E = ARGS.atomic_e
+ATOMIC_BETA = ARGS.atomic_beta
+ATOMIC_GAMMA = ARGS.atomic_gamma
+
+ATOMIC_OPS_REWARD = AtomicOpsReward(dialect="sqlite", e=ATOMIC_E, beta=ATOMIC_BETA, gamma=ATOMIC_GAMMA)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 
@@ -128,26 +159,36 @@ _get_intrinsic()
 
 # ───────────────────────── DATASET BUILDING ───────────────────────
 def load_training_dataset() -> Dataset:
-    # Load all HF datasets saved under DATA_ROOT and combine
     datasets_to_concat: List[Dataset] = []
     if not os.path.isdir(DATA_ROOT):
         raise RuntimeError(f"Data root not found: {DATA_ROOT}")
 
-    for name in sorted(os.listdir(DATA_ROOT)):
-        path = os.path.join(DATA_ROOT, name)
-        if not os.path.isdir(path):
-            continue
-        try:
-            ds_or_dd = load_from_disk(path)
-        except Exception:
-            continue
-        # Accept DatasetDict with 'train' or a single Dataset
+    # Try loading DATA_ROOT directly as a single dataset first
+    try:
+        ds_or_dd = load_from_disk(DATA_ROOT)
         if hasattr(ds_or_dd, "keys") and callable(getattr(ds_or_dd, "keys", None)):
-            # DatasetDict
             if "train" in ds_or_dd:
                 datasets_to_concat.append(ds_or_dd["train"])
         else:
             datasets_to_concat.append(ds_or_dd)
+    except Exception:
+        pass
+
+    # Fall back to scanning subdirectories if direct load found nothing
+    if not datasets_to_concat:
+        for name in sorted(os.listdir(DATA_ROOT)):
+            path = os.path.join(DATA_ROOT, name)
+            if not os.path.isdir(path):
+                continue
+            try:
+                ds_or_dd = load_from_disk(path)
+            except Exception:
+                continue
+            if hasattr(ds_or_dd, "keys") and callable(getattr(ds_or_dd, "keys", None)):
+                if "train" in ds_or_dd:
+                    datasets_to_concat.append(ds_or_dd["train"])
+            else:
+                datasets_to_concat.append(ds_or_dd)
 
     if not datasets_to_concat:
         raise RuntimeError(f"No datasets loaded from {DATA_ROOT}")
@@ -455,18 +496,26 @@ def check_sql_correct(dataset_name: str, db_id: str, predicted_sql: str, ground_
     return {"ok": ok, "pred_res": pred_res, "gt_res": {"ok": True, "rows": gt_rows}}
 
 
+# ───────────────────────── QUALITY SCORER ─────────────────────────
+# Quality scorer is in memory.compute_intrinsic_reward module
+from memory.compute_intrinsic_reward import calculate_reasoning_quality
+
+
 # ───────────────────────── REWARD FUNCTION ─────────────────────────
 FORMAT_BONUS_W = 1.0
 
 
+_reward_call_count = 0  # tracks reward_fn invocations for periodic sample logging
+
 def reward_fn(prompts, completions, **kwargs):
+    global _reward_call_count
+    _reward_call_count += 1
+
     gt_sqls: List[List[str]] = kwargs["groundtruth_sqls"]
     db_ids: List[str] = kwargs["db_id"]
     datasets: List[str] = kwargs["dataset_name"]
 
     rewards: List[float] = []
-
-    print(completions[0])
 
     for i, (comp, gt_sql, db_id, dset) in enumerate(zip(completions, gt_sqls, db_ids, datasets)):
         pred_sql = extract_sql_from_completion(comp)
@@ -516,24 +565,92 @@ def reward_fn(prompts, completions, **kwargs):
                 if thought is None:
                     thought = comp.strip()
                 if len(thought) > 30:
-                    # thought_reward = _INTRINSIC.compute_thought_reward(thought, db_id)
-                    thought_reward = _get_intrinsic().compute_thought_reward(thought, db_id)
+                    thought_reward = _get_intrinsic().compute_thought_reward(
+                        thought, db_id,
+                        top_k=INTRINSIC_TOP_K,
+                        same_db_retrieval=SAME_DB_RETRIEVAL,
+                        only_same_db_retrieval=ONLY_SAME_DB_RETRIEVAL,
+                    )
             elif exec_score == 2.0:
                 thought_reward = 1.0
 
         # If the execution score indicates correctness, persist the thought to memory.
         if not NO_MEMORY and exec_score >= 2.0:
             if thought:
-                try:
-                    _ =_get_intrinsic().save_thought(
-                        dataset_name=dset,
-                        db_id=db_id,
-                        thought=thought,
-                        model_name=os.path.basename(MODEL_PATH),
-                    )
-                except Exception as e:
-                    if DEBUG:
-                        print(f"[memory] Failed to save thought: {e}")
+                # Quality gate: only save high-quality reasoning traces
+                prompt_for_quality = prompts[i] if isinstance(prompts, list) and i < len(prompts) else None
+                if not prompt_for_quality:
+                    if DEBUG and i == 0:
+                        print(f"[memory] WARNING: No prompt available for quality check, rejecting thought")
+                    should_insert = False
+                    quality_score = 0.0
+                else:
+                    try:
+                        quality_score, should_insert = calculate_reasoning_quality(
+                            thought,
+                            pred_sql=pred_sql,
+                            prompt=prompt_for_quality,
+                            debug=DEBUG,
+                        )
+                    except Exception as e:
+                        should_insert = False
+                        quality_score = 0.0
+                        if DEBUG and i == 0:
+                            print(f"[memory] Quality check failed: {e}, rejecting thought")
+
+                if should_insert:
+                    try:
+                        _ = _get_intrinsic().save_thought(
+                            dataset_name=dset,
+                            db_id=db_id,
+                            thought=thought,
+                            model_name=os.path.basename(MODEL_PATH),
+                        )
+                        if DEBUG and i == 0:
+                            print(f"[memory] Saved thought with quality score: {quality_score:.3f}")
+                    except Exception as e:
+                        if DEBUG:
+                            print(f"[memory] Failed to save thought: {e}")
+                else:
+                    if DEBUG and i == 0:
+                        print(f"[memory] Rejected thought due to low quality (score: {quality_score:.3f})")
+
+        # Save failed reasoning traces to separate collection
+        if not NO_MEMORY and exec_score < 2.0:
+            if thought:
+                prompt_for_quality = prompts[i] if isinstance(prompts, list) and i < len(prompts) else None
+                if not prompt_for_quality:
+                    if DEBUG and i == 0:
+                        print(f"[memory] WARNING: No prompt for failed thought quality check")
+                    quality_score = 0.0
+                    should_insert = False
+                else:
+                    try:
+                        quality_score, should_insert = calculate_reasoning_quality(
+                            thought,
+                            pred_sql=pred_sql,
+                            prompt=prompt_for_quality,
+                            debug=DEBUG,
+                        )
+                    except Exception as e:
+                        should_insert = False
+                        quality_score = 0.0
+                        if DEBUG and i == 0:
+                            print(f"[memory] Failed thought quality check error: {e}")
+
+                if should_insert:
+                    try:
+                        _ = _get_intrinsic().save_failed_thought(
+                            dataset_name=dset,
+                            db_id=db_id,
+                            thought=thought,
+                            model_name=os.path.basename(MODEL_PATH),
+                        )
+                        if DEBUG and i == 0:
+                            print(f"[memory] Saved failed thought with quality score: {quality_score:.3f}")
+                    except Exception as e:
+                        if DEBUG:
+                            print(f"[memory] Failed to save failed thought: {e}")
 
         # Total reward = format bonus + execution similarity.
         # If you want to *require* format bonus to get any reward (your original behavior), keep the gate:
@@ -560,6 +677,20 @@ def reward_fn(prompts, completions, **kwargs):
             print("thought_reward:", thought_reward)
             print("TOTAL:", total)
             print("════════════════════════════════\n")
+
+        # Periodic sample logging every 100 reward calls for collapse monitoring.
+        # Check the <think> content in training.log after ~500 steps to detect degeneration.
+        if i == 0 and _reward_call_count % 100 == 0:
+            think_text = (thought or "").strip()
+            think_preview = think_text[:500] if think_text else "<empty>"
+            print(f"\n[SAMPLE step={_reward_call_count}]")
+            print(f"  DB: {dset}/{db_id}")
+            print(f"  THINK: {think_preview}")
+            print(f"  FORMAT_OK: {bool(format_bonus)}")
+            print(f"  EXEC_SCORE: {exec_score:.3f}")
+            print(f"  THOUGHT_REWARD: {thought_reward:.3f}")
+            print(f"  TOTAL_REWARD: {total:.3f}")
+            print(f"[/SAMPLE]\n")
 
         rewards.append(float(total))
 
@@ -743,37 +874,32 @@ def main():
 
     training_args = GRPOConfig(
         output_dir=OUT_DIR,
-        #gradient_checkpointing=True,
-        #gradient_checkpointing_kwargs={"use_reentrant": False},
         num_train_epochs=-1,
         max_steps=MAX_STEPS,
         logging_steps=1,
-        learning_rate=8e-6,            # full-FT on 0.6B
-        gradient_accumulation_steps=32,
+        learning_rate=LEARNING_RATE,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
         num_generations=NUM_GENERATIONS,
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
         max_prompt_length=MAX_PROMPT_LEN,
         max_completion_length=MAX_COMPLETION_LENGTH,
-        save_steps=400,
+        temperature=1.0,
+        beta=ARGS.beta,
+        warmup_ratio=ARGS.warmup_ratio,
+        warmup_steps=ARGS.warmup_steps,
+        max_grad_norm=ARGS.max_grad_norm,
+        save_steps=SAVE_STEPS,
         bf16=True,
-        save_total_limit=6,
+        save_total_limit=SAVE_TOTAL_LIMIT,
         report_to="tensorboard",
         logging_dir=os.path.join(OUT_DIR, "logs"),
         use_vllm=USE_VLLM,
         vllm_mode=VLLM_MODE,
-
-        # >>> Thêm 2 dòng FSDP này <<<
-        # fsdp="full_shard auto_wrap",
-        # fsdp_config={
-        #     "xla": False,
-        #     "sync_module_states": True,
-        #     "use_orig_params": True,
-        #     # auto-wrap theo lớp Transformer của Qwen-2.5
-        #     "transformer_layer_cls_to_wrap": "Qwen2DecoderLayer",
-        #     # có thể bật CPU offload nếu vẫn thiếu VRAM
-        #     "cpu_offload": False
-        # },
+        vllm_server_host=ARGS.vllm_server_host,
+        vllm_server_port=ARGS.vllm_server_port,
+        vllm_enable_sleep_mode=(VLLM_MODE == "colocate" and not ARGS.vllm_no_sleep),
+        use_liger_kernel=USE_LIGER_KERNEL,
     ) 
 
     trainer = APIAwareGRPOTrainer(

@@ -6,8 +6,11 @@ import numpy as np
 class AtomicOpsReward:
     """Compute Jaccard similarity between atomic ops of two SQL queries."""
 
-    def __init__(self, *, dialect: str = "sqlite", module_path: Optional[str] = None) -> None:
+    def __init__(self, *, dialect: str = "sqlite", module_path: Optional[str] = None, e: float = 0.30, beta: float = 0.71, gamma: float = 5.0) -> None:
         self.dialect = dialect
+        self.e = e
+        self.beta = beta
+        self.gamma = gamma
 
     def _ops_set(self, sql: str) -> Set[str]:
         try:
@@ -17,8 +20,11 @@ class AtomicOpsReward:
         return set(ops)
 
     # execution-weighted Jaccard with power penalty
-    def execution_weighted_jaccard(self, s, e=0.7, beta=0.3, gamma=3.0) -> float:
+    def execution_weighted_jaccard(self, s, e: Optional[float] = None, beta: Optional[float] = None, gamma: Optional[float] = None) -> float:
         s = np.asarray(s)
+        e = e if e is not None else self.e
+        beta = beta if beta is not None else self.beta
+        gamma = gamma if gamma is not None else self.gamma
         return float(e * s + (1.0 - e) * beta * (s ** gamma))
 
     def score(self, sql_a: str, sql_b: str) -> float:
