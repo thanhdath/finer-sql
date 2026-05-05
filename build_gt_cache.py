@@ -13,25 +13,21 @@ from datasets import Dataset, load_from_disk
 
 
 def process_single_sample(args_tuple):
-    """Process a single sample and return the result."""
-    (ex, api_url, timeout_ms, max_rows) = args_tuple
-    
-    dataset_name = ex.get("dataset_name")
-    db_id = ex.get("db_id")
-    gt_sql = ex.get("groundtruth_sqls")[0]
-    
-    if not dataset_name or not db_id or not gt_sql:
+    """Process a single (dataset_name, db_id, sql) entry and return the result."""
+    (dataset_name, db_id, sql, api_url, timeout_ms, max_rows) = args_tuple
+
+    if not dataset_name or not db_id or not sql:
         return {
             "key": None,
             "result": None,
             "error": "Missing required fields",
             "processed": False
         }
-    
-    key = (dataset_name, db_id, gt_sql)
-    
+
+    key = (dataset_name, db_id, sql)
+
     try:
-        res = call_sql_api(api_url, dataset_name, db_id, gt_sql, timeout_ms=timeout_ms, max_rows=max_rows)
+        res = call_sql_api(api_url, dataset_name, db_id, sql, timeout_ms=timeout_ms, max_rows=max_rows)
         return {
             "key": key,
             "result": res,
@@ -77,13 +73,24 @@ def call_sql_api(api_url: str, dataset_name: str, db_id: str, sql: str, *, timeo
 
 def iter_train_datasets(data_root: str) -> List[Dataset]:
     ds_list: List[Dataset] = []
+    # Try loading data_root directly as a single dataset first
+    try:
+        dd = load_from_disk(data_root)
+        if hasattr(dd, "keys") and callable(getattr(dd, "keys", None)):
+            if "train" in dd:
+                ds_list.append(dd["train"])
+        else:
+            ds_list.append(dd)
+        if ds_list:
+            return ds_list
+    except Exception:
+        pass
+    # Fall back to scanning subdirectories
     for name in sorted(os.listdir(data_root)):
         path = os.path.join(data_root, name)
         if not os.path.isdir(path):
             continue
-        # Keep only train datasets (by directory name or embedded split)
         if "train" not in name:
-            # Still allow if DatasetDict has a 'train' split
             try:
                 dd = load_from_disk(path)
                 if hasattr(dd, "keys") and "train" in dd:
@@ -145,39 +152,38 @@ def main() -> None:
             rows = rows[:args.limit_samples]
         all_samples.extend(rows)
     
-    # Filter out samples that already have results in cache
-    samples_to_process = []
+    # Flatten samples into individual (dataset_name, db_id, sql) entries, one per SQL
+    sql_entries_to_process = []
     skipped_existing = 0
-    
+
     for ex in all_samples:
         dataset_name = ex.get("dataset_name")
         db_id = ex.get("db_id")
-        gt_sql = ex.get("groundtruth_sqls")[0]
-        
-        if not dataset_name or not db_id or not gt_sql:
+        groundtruth_sqls = ex.get("groundtruth_sqls") or []
+        if not dataset_name or not db_id:
             continue
-            
-        key = (dataset_name, db_id, gt_sql)
-        
-        # Check if we already have a result for this sample
-        if key in existing_cache:
-            cache_entry = existing_cache[key]
-            # Skip if we have a valid result (list of rows) or timeout entry
-            if isinstance(cache_entry, list) or (isinstance(cache_entry, dict) and cache_entry.get("timeout")):
-                skipped_existing += 1
+        for sql in groundtruth_sqls:
+            if not sql:
                 continue
-        
-        samples_to_process.append(ex)
+            key = (dataset_name, db_id, sql)
+            if key in existing_cache:
+                cache_entry = existing_cache[key]
+                if isinstance(cache_entry, list) or (
+                    isinstance(cache_entry, dict) and cache_entry.get("timeout")
+                ):
+                    skipped_existing += 1
+                    continue
+            sql_entries_to_process.append((dataset_name, db_id, sql))
     
     print(f"Total samples: {len(all_samples)}")
-    print(f"Samples already in cache: {skipped_existing}")
-    print(f"Samples to process: {len(samples_to_process)}")
-    print(f"Processing {len(samples_to_process)} samples with {args.num_processes} processes...")
+    print(f"SQL entries already in cache: {skipped_existing}")
+    print(f"SQL entries to process: {len(sql_entries_to_process)}")
+    print(f"Processing {len(sql_entries_to_process)} SQL entries with {args.num_processes} processes...")
     
-    # Prepare arguments for multiprocessing (only samples that need processing)
+    # Prepare arguments for multiprocessing (one entry per SQL)
     process_args = [
-        (ex, args.api_url, args.timeout_ms, args.max_rows) 
-        for ex in samples_to_process
+        (dataset_name, db_id, sql, args.api_url, args.timeout_ms, args.max_rows)
+        for dataset_name, db_id, sql in sql_entries_to_process
     ]
     
     # Initialize cache with existing entries
@@ -187,9 +193,17 @@ def main() -> None:
     skipped = 0
     timeouts = 0
     timeout_entries = []  # Store timeout details for logging
-    
-    # If no samples to process, just save the existing cache
-    if not samples_to_process:
+    SAVE_EVERY = 5000  # Checkpoint every N processed entries
+
+    def _save_cache():
+        tmp_path = args.out + ".tmp"
+        with open(tmp_path, "wb") as _f:
+            pickle.dump(cache, _f)
+        os.replace(tmp_path, args.out)
+        print(f"[checkpoint] Saved {len(cache)} entries → {args.out}")
+
+    # If no entries to process, just save the existing cache
+    if not sql_entries_to_process:
         print("No new samples to process. Saving existing cache...")
     else:
         with ProcessPoolExecutor(max_workers=args.num_processes) as executor:
@@ -229,9 +243,10 @@ def main() -> None:
                 if res.get("ok") and isinstance(res.get("rows"), list):
                     cache[key] = res["rows"]
                 else:
-                    # Check if it's a timeout error
+                    # Check if it's a timeout error (check timed_out flag first, then error message)
                     error_msg = res.get("error", "")
-                    if "timed out" in error_msg.lower() or "timeout" in error_msg.lower():
+                    is_timeout = res.get("timed_out", False) or "timed out" in error_msg.lower() or "timeout" in error_msg.lower() or "interrupt" in error_msg.lower()
+                    if is_timeout:
                         # Cache timeout result separately
                         cache[key] = {"timeout": True, "error": error_msg}
                         timeouts += 1
@@ -251,6 +266,9 @@ def main() -> None:
                 total += 1
                 processed += 1
                 print(f"{processed}")
+                # Periodic checkpoint save
+                if total % SAVE_EVERY == 0:
+                    _save_cache()
 
     # Write final cache to pickle file
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

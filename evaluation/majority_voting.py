@@ -247,14 +247,22 @@ def is_syntax_error(result: Dict[str, Any]) -> bool:
         return True
     return False
 
-def normalize_execution_result(result: Dict[str, Any]) -> str:
+def normalize_execution_result(result: Dict[str, Any], gt_sql: Optional[str] = None) -> str:
     """Normalize execution result to a header-agnostic signature for grouping via NumPy values.
     - Failures: error prefix
     - Successes: signature from per-row sorted values (ignores headers and column order)
+
+    Note: gt_sql is accepted for forward-compat / experimental Spider-strict semantics
+    (multiset + ORDER BY-aware), but using strict semantics in MV grouping was
+    empirically a net loss (-1 EX on Spider) because splitting groups by row order
+    often picks a less popular candidate that's not Spider-correct either. The
+    fundamental limit is model bias (e.g., all 30 candidates use DESC when gold is
+    ASC) — no MV strategy can fix that without ground truth at inference time.
+    Kept set+sorted semantics as default.
     """
     if not result.get("ok", False):
         error = result.get("error", "Unknown error")
-        return f"ERROR: {error[:100]}"
+        return f"ERROR: {error}"
 
     vals = _rows_to_value_tuples_agnostic(result.get("rows"))
     if vals is None:
@@ -297,7 +305,7 @@ def majority_voting_for_sample(sample: Dict[str, Any], selection_strategy: Optio
             else:
                 result = {"ok": False, "error": "No cached result"}
                 # Explicitly log missing cached results for visibility
-                preview = (sql or "").replace("\n", " ")[:120]
+                preview = (sql or "").replace("\n", " ")
                 print(f"    [WARN] sample {sample_id}: candidate #{i} has no cached result. SQL preview: {preview}")
             pred_results.append({"sql": sql, "result": result, "index": i})
     else:
@@ -325,13 +333,17 @@ def majority_voting_for_sample(sample: Dict[str, Any], selection_strategy: Optio
             valid_pred_results.append(pred)
             if not pred["result"].get("ok", False):
                 infrastructure_failures.append(pred)
+
+    # Pass ground_truth_sql to normalize_execution_result so it can match Spider's
+    # eval_exec_match semantics (order matters when gold has ORDER BY)
+    _gt_sql_for_norm = ground_truth_sql
     
     # Group valid predicted SQLs by execution result (only successful executions)
     result_groups = defaultdict(list)
     for pred in valid_pred_results:
         # Only group successful executions, not errors
         if pred["result"].get("ok", False):
-            normalized_result = normalize_execution_result(pred["result"])
+            normalized_result = normalize_execution_result(pred["result"], gt_sql=_gt_sql_for_norm)
             result_groups[normalized_result].append(pred)
     
     # Sort groups by size (descending)
@@ -392,7 +404,7 @@ def majority_voting_for_sample(sample: Dict[str, Any], selection_strategy: Optio
         reason_counts: Dict[str, int] = defaultdict(int)
         for item in infrastructure_failures:
             msg = str(item.get("result", {}).get("error", "")).strip()
-            reason = (msg or "UNKNOWN").split("\n", 1)[0][:120]
+            reason = (msg or "UNKNOWN").split("\n", 1)[0]
             reason_counts[reason] += 1
         top_reasons = sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)
         # print(f"    Infrastructure failures: {len(infrastructure_failures)}")
@@ -415,7 +427,7 @@ def majority_voting_for_sample(sample: Dict[str, Any], selection_strategy: Optio
         "ground_truth_execution_success": gt_result.get("ok", False),
         "ground_truth_error": gt_result.get("error") if not gt_result.get("ok") else None,
         "ground_truth_execution_result": gt_result,
-        "ground_truth_result_key": normalize_execution_result(gt_result),
+        "ground_truth_result_key": normalize_execution_result(gt_result, gt_sql=ground_truth_sql),
         "num_predicted_sqls": len(predicted_sqls),
         "num_syntax_errors": syntax_error_count,
         # Redefined to count only successful (ok=True) non-syntax-error SQLs
@@ -450,7 +462,7 @@ def majority_voting_for_sample(sample: Dict[str, Any], selection_strategy: Optio
                     and bool(items[0]["result"].get("ok", False))
                     and results_equal(gt_rows, items[0]["result"].get("rows"))
                 ),
-                "sqls": [{"index": item["index"], "sql": item["sql"][:100]} for item in items]
+                "sqls": [{"index": item["index"], "sql": item["sql"]} for item in items]
             }
             for result, items in sorted_groups
         }
@@ -471,19 +483,19 @@ def main():
     parser.add_argument(
         "--input-pkl",
         type=str,
-        default="/home/datht/mats/sql_writer/evaluation/evaluation_results-3b/detailed_results.pkl",
+        default="output/detailed_results.pkl",
         help="Path to detailed_results.pkl produced by evaluate_bird_dev.py"
     )
     parser.add_argument(
         "--input-file",
         type=str,
-        default="/home/datht/mats/sql_writer/evaluation/evaluation_results-3b/detailed_results.json",
+        default="output/detailed_results.json",
         help="Fallback path to detailed_results.json when PKL is unavailable"
     )
     parser.add_argument(
         "--output-file",
         type=str,
-        default="/home/datht/mats/sql_writer/evaluation/majority_voting_results.json",
+        default="output/majority_voting_results.json",
         help="Path to save majority voting results"
     )
     parser.add_argument(
@@ -649,10 +661,18 @@ def main():
     # Export format depending on dataset: BIRD -> predict_dev.json, Spider -> pred_dev.sql
     pkl_dir = os.path.dirname(args.input_pkl) if args.input_pkl else os.path.dirname(args.input_file)
     # Determine dataset by inspecting samples; fallback to input path
+    # Prioritize sample dataset_name field over path (path may contain model names like "FINER-SQL-3B-BIRD")
     dataset_name_concat = " ".join([str(s.get("dataset_name", "")).lower() for s in samples])
     input_path_lower = (args.input_pkl or args.input_file or "").lower()
-    is_bird = ("bird" in dataset_name_concat) or ("bird" in input_path_lower)
-    is_spider = ("spider" in dataset_name_concat) or ("spider" in input_path_lower)
+    # Use sample content as primary signal; path only as fallback when samples give no signal
+    content_is_bird = "bird" in dataset_name_concat
+    content_is_spider = ("spider" in dataset_name_concat) and not content_is_bird
+    if content_is_bird or content_is_spider:
+        is_bird = content_is_bird
+        is_spider = content_is_spider
+    else:
+        is_bird = "bird" in input_path_lower
+        is_spider = "spider" in input_path_lower
 
     # Sort results by sample_id for stable export order
     sorted_results = sorted(results, key=lambda x: int(x.get("sample_id", 0)))
@@ -719,15 +739,17 @@ def main():
         except Exception as e:
             print(f"[WARN] Failed to save pred index mapping: {e}")
 
-        # Run Spider evaluation using the official evaluator
-        # Auto-detect Spider dataset root (contains dev_gold.sql, database/, tables.json)
+        # Run Spider evaluation using the official evaluator.
+        # Spider root contains dev_gold.sql, database/, tables.json. Configure via:
+        #   SPIDER_DEV_ROOT env var, or place the dataset at ./data/spider/
         candidate_roots = [
-            "/home/datht/mats/data/spider",
-            "/home/datht/mats/data/sft_data_collections/spider",
-            "/home/datht/mats/data/Spider",
+            os.environ.get("SPIDER_DEV_ROOT"),
+            "data/spider",
         ]
         spider_root = None
         for root in candidate_roots:
+            if not root:
+                continue
             if (
                 os.path.exists(os.path.join(root, "dev_gold.sql"))
                 and os.path.isdir(os.path.join(root, "database"))
@@ -736,8 +758,9 @@ def main():
                 spider_root = root
                 break
         if spider_root is None:
-            print("[WARN] Could not auto-detect Spider dataset root; using default '/home/datht/mats/data/spider'")
-            spider_root = "/home/datht/mats/data/spider"
+            print("[WARN] Could not auto-detect Spider dataset root; "
+                  "set SPIDER_DEV_ROOT or place the Spider dev release at ./data/spider/")
+            spider_root = "data/spider"
 
         gold_path = os.path.join(spider_root, "dev_gold.sql")
         db_path = os.path.join(spider_root, "database")
@@ -893,11 +916,11 @@ def main():
                                 err_msg = str(maj_sel_res.get("error"))
                             elif isinstance(maj_gt_res, dict) and maj_gt_res.get("error"):
                                 err_msg = str(maj_gt_res.get("error"))
-                            preview_sql = (maj_sel_sql or maj_gt_sql)[:200]
-                            preview_q = (question or "")[:160]
+                            preview_sql = (maj_sel_sql or maj_gt_sql)
+                            preview_q = (question or "")
                             print(
                                 f"[INFRA] connection_aborted sample_id={sample_id} db_id={db_id} "
-                                f"sql='{preview_sql}' error='{(err_msg or '')[:160]}'\n  Q: {preview_q}"
+                                f"sql='{preview_sql}' error='{(err_msg or '')}'\n  Q: {preview_q}"
                             )
                         else:
                             infra_other_count += 1

@@ -13,9 +13,9 @@ from pydantic import BaseModel, Field
 # -----------------------------
 # Config (no memory watchdogs here)
 # -----------------------------
-SPIDER_DB_ROOT = "/app/data/spider/database"
-BIRD_TRAIN_DB_ROOT = "/app/data/bird/train/train_databases"
-BIRD_DEV_DB_ROOT = "/app/data/bird/dev/dev_databases"
+SPIDER_DB_ROOT = os.getenv("SPIDER_DB_ROOT", "/app/data/spider/database")
+BIRD_TRAIN_DB_ROOT = os.getenv("BIRD_TRAIN_DB_ROOT", "/app/data/bird/train/train_databases")
+BIRD_DEV_DB_ROOT = os.getenv("BIRD_DEV_DB_ROOT", "/app/data/bird/dev/dev_databases")
 SPIDER2_DB_ROOT = os.getenv("SPIDER2_DB_ROOT", "/home/datht/Spider2/spider2-lite/resource/databases/spider2-localdb")
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "100"))
 DEFAULT_TIMEOUT_MS = int(os.getenv("DEFAULT_TIMEOUT_MS", "120000"))
@@ -178,7 +178,7 @@ def _run_sandbox_thread(dbfile: Path, sql: str, timeout_ms: int, max_rows: int) 
     # Execute SQL on a temp copy and rollback to avoid modifying source and to avoid locking it
     deadline_ts = time.time() + (timeout_ms / 1000.0)
 
-    def progress_cb(_):
+    def progress_cb():
         return 1 if time.time() >= deadline_ts else 0
 
     try:

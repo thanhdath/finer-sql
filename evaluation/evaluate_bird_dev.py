@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# evaluate_bird_dev.py – Evaluation script for BIRD dev dataset
+# -*- coding: utf-8 -*-
+# evaluate_bird_dev.py - Evaluation script for BIRD dev dataset
 
 from __future__ import annotations
 import os
@@ -21,6 +22,8 @@ multiprocessing.set_start_method('spawn', force=True)
 # Ensure vLLM uses spawn multiprocessing and unbuffered logs by default
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
+# v1 engine + shared GPU: huge default max_len blows KV budget; v0 is more predictable on sm75.
+os.environ.setdefault("VLLM_USE_V1", "0")
 
 import pandas as pd
 from datasets import load_from_disk
@@ -44,8 +47,8 @@ def extract_sql_from_completion(text: str) -> Optional[str]:
 
 
 # Minimal SQL API utilities (inlined to avoid importing training code)
-API_URL = "http://192.168.1.108:8001/execute"
-# API_URL = "http://localhost:8101/execute"
+# API_URL = "http://192.168.1.108:8001/execute"
+API_URL = "http://localhost:8001/execute"  # Points to local SQL API on gf-henry
 
 TIMEOUT_MS_DEFAULT = 60000
 MAX_ROWS_DEFAULT = 10000
@@ -85,6 +88,7 @@ def call_sql_api(dataset_name: str, db_id: str, sql: str, *, mode: Optional[str]
                 "timed_out": False,
             }
         data = resp.json()
+        print(str(data.get("pandas_result"))[:300])
         return {
             "ok": bool(data.get("ok", False)),
             "statement_type": data.get("statement_type"),
@@ -246,8 +250,8 @@ def get_config():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="/home/datht/mats/alignment-handbook/output/Qwen-2.5-Coder-1.5B-SQL-Writer",
-        help="Path to the model to load with vLLM"
+        default="thanhdath/FINER-SQL-3B-BIRD",
+        help="HF model id or local path to load with vLLM"
     )
     parser.add_argument(
         "--data-path",
@@ -313,6 +317,24 @@ def get_config():
         action="store_true",
         help="Only generate and save predictions; skip executing SQLs"
     )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.5,
+        help="vLLM gpu_memory_utilization (0-1 fraction of GPU memory)"
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        help="vLLM dtype: auto, bfloat16, float16, float32. Use float16 for GPUs with compute capability < 8.0"
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=4096,
+        help="vLLM max_model_len (KV budget). Use 4096 for BIRD+2048 completion; lower if sharing GPU.",
+    )
 
     args = parser.parse_args()
 
@@ -329,6 +351,9 @@ def get_config():
         "seed": int(args.seed),
         "skip_executing": bool(args.skip_executing),
         "update_cache": bool(args.update_cache),
+        "gpu_memory_utilization": float(args.gpu_memory_utilization),
+        "dtype": args.dtype,
+        "max_model_len": int(args.max_model_len),
     }
 
 
@@ -379,7 +404,7 @@ class BIRDEvaluator:
             ds = "bird" if "bird" in dp else ("spider" if "spider" in dp else None)
             sp = "train" if "train" in dp else ("dev" if "dev" in dp else None)
             if ds and sp:
-                self.exec_cache_file = os.path.join("/home/datht/mats/sql_writer/evaluation", f"execution_cache_{ds}_{sp}.pkl")
+                self.exec_cache_file = os.path.join(config['output_dir'], f"execution_cache_{ds}_{sp}.pkl")
             else:
                 self.exec_cache_file = os.path.join(config['output_dir'], "execution_cache.pkl")
         self.exec_cache: Dict[tuple, Dict[str, Any]] = {}
@@ -402,12 +427,28 @@ class BIRDEvaluator:
         """Setup vLLM for inference."""
         from vllm import LLM, SamplingParams
         self.vllm_model_path = self.config['model_path']
+        dtype = self.config.get("dtype", "auto")
+        if dtype == "auto":
+            # Auto-detect: bfloat16 needs compute capability >= 8.0
+            if torch.cuda.is_available():
+                cc = torch.cuda.get_device_capability()
+                dtype = "bfloat16" if cc[0] >= 8 else "float16"
+            else:
+                dtype = "float32"
+        import os as _os
+        # vLLM 0.12.0 v1 engine uses torch.compile with CUDA graphs by default.
+        # On TITAN RTX (compute 7.5, 24GB) the CUDA graph capture OOMs during warmup
+        # because torch.compile pre-allocates for all 51 batch sizes.
+        # Force v0 engine to get simple eager-mode execution.
+        _os.environ["VLLM_USE_V1"] = "0"
         self.llm = LLM(
             model=self.vllm_model_path,
-            dtype="bfloat16" if torch.cuda.is_available() else "float32",
+            dtype=dtype,
             trust_remote_code=True,
             tensor_parallel_size=1,
-            gpu_memory_utilization=0.9
+            max_model_len=int(self.config.get("max_model_len", 4096)),
+            gpu_memory_utilization=float(self.config.get("gpu_memory_utilization", 0.5)),
+            enforce_eager=True,  # skip CUDA graph capture to save memory
         )
         self.sampling_params = SamplingParams(
             temperature=float(self.config.get("temperature", 1.0)),
@@ -440,7 +481,7 @@ class BIRDEvaluator:
         
         return completions_per_prompt
     
-    
+
     
     def analyze_sql_quality(self, predicted_sql: str, ground_truth_sql: str, dataset_name: str, db_id: str) -> Dict[str, Any]:
         """Analyze the quality of generated SQL using API execution."""
@@ -630,12 +671,11 @@ class BIRDEvaluator:
         except Exception as e:
             print(f"Failed to save detailed results PKL to {detailed_pkl}: {e}")
         
-        # Persist execution cache to disk if updating is enabled or n==30
-        if self.config.get("update_cache", False) or int(self.config.get("num_samples", 0)) >= 30:
-            try:
-                self.save_execution_cache()
-            except Exception as e:
-                print(f"Failed to save execution cache to {self.exec_cache_file}: {e}")
+        # Always persist execution cache to disk for reuse across evaluations
+        try:
+            self.save_execution_cache()
+        except Exception as e:
+            print(f"Failed to save execution cache to {self.exec_cache_file}: {e}")
         
         return metrics
 

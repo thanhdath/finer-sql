@@ -10,6 +10,7 @@ import json
 import multiprocessing
 import random
 import time
+import glob
 from datetime import timedelta
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
@@ -267,6 +268,50 @@ def choose_group_vav(groups: Dict[str, Dict[str, Any]]) -> str:
     return "NO_RESULTS"
 
 
+# Ground truth execution results loading
+GT_EXEC_RESULT_DIR = "/home/datht/Spider2/spider2-lite/evaluation_suite/gold/exec_result/"
+
+def load_gt_execution_results(instance_id: str) -> List[Optional[pd.DataFrame]]:
+    """Load all ground truth execution results for an instance_id.
+    
+    Returns a list of DataFrames, one for each variant (_a, _b, _c, etc. or no suffix).
+    Returns empty list if no ground truth results found.
+    
+    Logic:
+    - If a file without suffix exists (e.g., bq051.csv), return only that
+    - Otherwise, collect all files with suffix _a, _b, _c, etc.
+    """
+    gt_results: List[Optional[pd.DataFrame]] = []
+    base_path = Path(GT_EXEC_RESULT_DIR)
+    
+    # First check if there's a file without suffix
+    csv_path_no_suffix = base_path / f"{instance_id}.csv"
+    if csv_path_no_suffix.exists():
+        try:
+            df = pd.read_csv(csv_path_no_suffix)
+            gt_results.append(df.fillna(""))
+        except Exception as e:
+            print(f"Warning: Failed to load {csv_path_no_suffix}: {e}")
+            gt_results.append(None)
+        # If file without suffix exists, return only that (single correct answer)
+        return gt_results
+    
+    # Otherwise, look for files with suffix _a, _b, _c, etc. using glob
+    pattern = str(base_path / f"{instance_id}_*.csv")
+    matching_files = sorted(glob.glob(pattern))
+    
+    for csv_path_str in matching_files:
+        csv_path = Path(csv_path_str)
+        try:
+            df = pd.read_csv(csv_path)
+            gt_results.append(df.fillna(""))
+        except Exception as e:
+            print(f"Warning: Failed to load {csv_path}: {e}")
+            gt_results.append(None)
+    
+    return gt_results
+
+
 # Worker utilities for parallel per-sample execution
 def _normalize_sql_static(sql: str) -> str:
     s = sql.strip()
@@ -284,9 +329,10 @@ def _init_worker(preloaded_cache: Dict[Tuple[str, str, str], Dict[str, Any]]):
 
 
 def _evaluate_sample_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Execute one sample's candidate SQLs with intra-sample dedup. No correctness checking."""
+    """Execute one sample's candidate SQLs with intra-sample dedup and recall checking against ground truth execution results."""
     dataset_name = entry["dataset_name"]
     db_id = entry["db_id"]
+    instance_id = entry.get("instance_id", "")
     predicted_sqls: List[str] = entry.get("predicted_sqls", [])
     full_completions = entry.get("full_completions", [])
     local_exec_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -315,7 +361,14 @@ def _evaluate_sample_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[
         local_exec_cache[key] = res
         return res
 
-    # Execute candidates only (no ground truth execution or correctness checking)
+    # Load ground truth execution results
+    gt_exec_results: List[Optional[pd.DataFrame]] = []
+    if instance_id:
+        gt_exec_results = load_gt_execution_results(instance_id)
+
+    # Execute candidates and check against ground truth execution results
+    any_correct = False
+    first_correct_index = -1
     candidate_exec_results: List[Optional[Dict[str, Any]]] = [None] * len(predicted_sqls)
     for idx, candidate_sql in enumerate(predicted_sqls):
         if not candidate_sql or not candidate_sql.strip():
@@ -333,6 +386,18 @@ def _evaluate_sample_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[
         try:
             pred_res = exec_with_local_cache(candidate_sql)
             candidate_exec_results[idx] = pred_res
+            
+            # Check if this candidate matches any ground truth execution result
+            if pred_res.get("ok", False) and gt_exec_results:
+                pred_df = _rows_to_dataframe(pred_res.get("rows"))
+                if pred_df is not None:
+                    # Compare against all ground truth results
+                    for gt_df in gt_exec_results:
+                        if gt_df is not None and dataframes_equal(gt_df, pred_df):
+                            any_correct = True
+                            if first_correct_index == -1:
+                                first_correct_index = idx
+                            break
         except Exception:
             candidate_exec_results[idx] = {
                 "ok": False,
@@ -347,7 +412,7 @@ def _evaluate_sample_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[
 
     result = {
         "sample_id": entry["sample_id"],
-        "instance_id": entry["instance_id"],
+        "instance_id": instance_id,
         "dataset_name": dataset_name,
         "db_id": db_id,
         "question": entry.get("question", ""),
@@ -355,9 +420,13 @@ def _evaluate_sample_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[
         "predicted_sqls": predicted_sqls,
         "full_completions": full_completions,
         "num_candidates": len(predicted_sqls),
+        "any_execution_correct": any_correct,
+        "first_correct_index": first_correct_index,
+        "num_gt_exec_results": len(gt_exec_results),
     }
     result_with_exec = dict(result)
     result_with_exec["candidate_execution_results"] = candidate_exec_results
+    result_with_exec["gt_execution_results"] = gt_exec_results
     return result, result_with_exec
 
 def get_config():
@@ -1007,13 +1076,25 @@ class BIRDEvaluator:
             if r.get("majority_voted_result", {}).get("ok", False)
         )
         
+        # Recall metrics (execution correctness against ground truth)
+        execution_recall_count = sum(1 for r in results if r.get("any_execution_correct", False))
+        execution_recall_rate = execution_recall_count / total_samples if total_samples else 0.0
+        
+        # Failed samples (no correct candidate)
+        failed_samples = [r for r in results if not r.get("any_execution_correct", False)]
+        failed_sample_ids = [r.get("instance_id", r.get("sample_id", "")) for r in failed_samples]
+        
         metrics = {
             "total_samples": total_samples,
             "has_any_sql_rate": has_any_sql_count / total_samples if total_samples else 0.0,
             "has_majority_voted_sql_rate": has_majority_voted_sql_count / total_samples if total_samples else 0.0,
             "successful_execution_rate": successful_execution_count / total_samples if total_samples else 0.0,
+            "execution_recall_at_n": execution_recall_rate,
+            "execution_recall_count": execution_recall_count,
             "total_syntax_errors": total_syntax_errors,
             "total_infrastructure_failures": total_infrastructure_failures,
+            "failed_samples": failed_samples,
+            "failed_sample_ids": failed_sample_ids,
         }
         
         return metrics
@@ -1142,6 +1223,15 @@ class BIRDEvaluator:
         with open(metrics_file, "w") as f:
             json.dump(metrics, f, indent=2, default=str)
         
+        # Save failed samples with IDs
+        failed_samples_file = os.path.join(self.config['output_dir'], "failed_samples.json")
+        failed_samples_data = {
+            "failed_sample_ids": metrics["failed_sample_ids"],
+            "failed_samples": metrics["failed_samples"]
+        }
+        with open(failed_samples_file, "w") as f:
+            json.dump(failed_samples_data, f, indent=2, default=str)
+        
         # Save summary
         summary_file = os.path.join(self.config['output_dir'], "summary.txt")
         with open(summary_file, "w") as f:
@@ -1151,15 +1241,21 @@ class BIRDEvaluator:
             f.write(f"Has any-SQL rate: {metrics['has_any_sql_rate']:.3f}\n")
             f.write(f"Has majority-voted SQL rate: {metrics['has_majority_voted_sql_rate']:.3f}\n")
             f.write(f"Successful execution rate: {metrics['successful_execution_rate']:.3f}\n")
+            f.write(f"Execution recall@N: {metrics['execution_recall_at_n']:.3f}\n")
+            f.write(f"Execution recall count: {metrics['execution_recall_count']}\n")
             f.write(f"Total syntax errors: {metrics['total_syntax_errors']}\n")
             f.write(f"Total infrastructure failures: {metrics['total_infrastructure_failures']}\n")
+            f.write(f"Failed sample IDs: {metrics['failed_sample_ids']}\n")
         
         print(f"Results saved to {self.config['output_dir']}")
         print(f"Has any-SQL rate: {metrics['has_any_sql_rate']:.3f}")
         print(f"Has majority-voted SQL rate: {metrics['has_majority_voted_sql_rate']:.3f}")
         print(f"Successful execution rate: {metrics['successful_execution_rate']:.3f}")
+        print(f"Execution recall@N: {metrics['execution_recall_at_n']:.3f}")
+        print(f"Execution recall count: {metrics['execution_recall_count']}")
         print(f"Total syntax errors: {metrics['total_syntax_errors']}")
         print(f"Total infrastructure failures: {metrics['total_infrastructure_failures']}")
+        print(f"Failed samples: {len(metrics['failed_sample_ids'])}")
 
 
 def main():
