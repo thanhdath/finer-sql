@@ -1,3 +1,4 @@
+[![arXiv](https://img.shields.io/badge/arXiv-2605.03465-b31b1b.svg)](https://arxiv.org/abs/2605.03465)
 ![visitors](https://visitor-badge.laobi.icu/badge?page_id=thanhdath.finer-sql)
 
 # FINER-SQL: Boosting Small Language Models for Text-to-SQL with Fine-Grained Execution Feedback and Cost-Efficient Rewards
