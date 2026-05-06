@@ -36,10 +36,7 @@ This helps solving the sparse reward issue of reinforcement learning in Text-to-
 ✅ Achieves 67.5% EX on BIRD when training only on BIRD train, and 85% EX on Spider using only a 3B model.  
 ⚡ Runs efficiently on a single 12-24 GB GPU.
 
------------
-**Backup Statistics**
 
-![Visitors](https://margherita-gustatory-zane.ngrok-free.dev/badge/thanhdath%2Ffiner-sql.svg?ngrok-skip-browser-warning=true)
 
 ## Setup environment
 
@@ -166,3 +163,9 @@ finer-sql/
 2. Train GRPO on SynSQL-2.5M with FINER-SQL's dense rewards.
 
 ---
+
+
+-----------
+**Backup Statistics**
+
+![Visitors](https://margherita-gustatory-zane.ngrok-free.dev/badge/thanhdath%2Ffiner-sql.svg?ngrok-skip-browser-warning=true)
