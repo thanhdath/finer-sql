@@ -105,6 +105,51 @@ def unique_sqls(sqls: List[str]) -> List[str]:
 
 FIELD_NAME = "augmented_sqls_for_grpo"
 
+# The gold SQL field differs by dataset in mats.<dataset>_<split>_samples.
+GOLD_FIELDS = ("SQL", "query", "sql", "ground_truth_sql")
+
+
+def doc_gold(doc: Dict[str, Any]) -> Optional[str]:
+    """The benchmark gold stored on a sample document, whatever it is called."""
+    for k in GOLD_FIELDS:
+        v = doc.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
+def find_sample_doc(coll, db_id: Any, sample_id: Any, dataset_name: Any = None):
+    """Fetch the sample document these correct SQLs belong to.
+
+    THE BUG THIS REPLACES.  The previous version addressed the document by
+    ``{"db_id": db_id, "_id": sample_id}`` only -- it assumed the collection's primary
+    key ``_id`` is the same number as the evaluation's ``sample_id``.  Where the two id
+    spaces disagree (they run parallel inside a database but are offset by however many
+    of that database's samples were dropped from one of them), ``_id == sample_id``
+    selects a DIFFERENT sample of the SAME database, a few positions along, and the
+    correct SQLs of sample N are written onto sample N-k.  That is how
+    bird/airline sample 5849 ("flights that landed at Lake Charles Regional on
+    2018/8/15") ended up carrying eleven references that count on-time departures on
+    2018/8/1, which are sample 5854's: a +5 drift that holds for that whole database.
+
+    The document is now looked up by its own ``sample_id`` field first and only falls
+    back to ``_id``; ``dataset_name`` is included when the collection carries it, because
+    BIRD and Spider reuse the same sample_id numbers.  The caller verifies the gold
+    before writing, so a wrong document can no longer be written to even if some third
+    id space is introduced later.
+    """
+    base: Dict[str, Any] = {"db_id": db_id}
+    if dataset_name is not None:
+        for q in ({**base, "dataset_name": dataset_name, "sample_id": sample_id},
+                  {**base, "dataset": dataset_name, "sample_id": sample_id}):
+            doc = coll.find_one(q)
+            if doc:
+                return doc
+    doc = coll.find_one({**base, "sample_id": sample_id})
+    if doc:
+        return doc
+    return coll.find_one({**base, "_id": sample_id})
+
 
 def build_planned_updates(
     detailed_results: List[Dict[str, Any]],
@@ -121,7 +166,10 @@ def build_planned_updates(
         "entries_with_updates": 0,
         "total_correct_sqls": 0,
         "total_new_sqls": 0,
+        "entries_no_document": 0,
+        "entries_gold_mismatch": 0,
     }
+    mismatches: List[Dict[str, Any]] = []
 
     for entry in detailed_results:
         stats["total_entries"] += 1
@@ -140,10 +188,27 @@ def build_planned_updates(
         stats["entries_with_correct"] += 1
         stats["total_correct_sqls"] += len(correct_sqls)
 
-        # Fetch existing doc to compute delta without mutating DB
-        existing = coll.find_one({"db_id": db_id, "_id": sample_id})
+        # Fetch the document these SQLs belong to, by its own sample_id (see
+        # find_sample_doc: addressing it by _id wrote them onto the wrong sample).
+        existing = find_sample_doc(coll, db_id, sample_id, entry.get("dataset_name"))
+        if existing is None:
+            stats["entries_no_document"] += 1
+            continue
+        # THE GUARD: the document's own gold must be the gold these SQLs were judged
+        # against.  If it is not, this is not that sample's document and nothing is
+        # written -- a wrong-sample write is impossible rather than merely unlikely.
+        stored_gold = doc_gold(existing)
+        if stored_gold is None or normalize_for_compare(stored_gold) != normalize_for_compare(gt_sql):
+            stats["entries_gold_mismatch"] += 1
+            mismatches.append({
+                "sample_id": sample_id, "db_id": db_id,
+                "eval_gold": canonicalize_for_storage(gt_sql),
+                "document_gold": canonicalize_for_storage(stored_gold or ""),
+                "document_id": str(existing.get("_id")),
+            })
+            continue
         existing_list: List[str] = []
-        if existing and isinstance(existing.get(FIELD_NAME), list):
+        if isinstance(existing.get(FIELD_NAME), list):
             existing_list = [str(x) for x in existing.get(FIELD_NAME) if isinstance(x, str)]
 
         # Normalize GT for storage and comparison
@@ -173,6 +238,8 @@ def build_planned_updates(
         planned_update = {
             "sample_id": sample_id,
             "db_id": db_id,
+            "document_id": existing.get("_id"),
+            "dataset_name": entry.get("dataset_name"),
             "existing_count": len(existing_list),
             "found_correct_count": len(correct_sqls),
             "additions_count": len(to_add),
@@ -185,6 +252,15 @@ def build_planned_updates(
             stats["total_new_sqls"] += len(to_add)
         planned.append(planned_update)
 
+    if mismatches:
+        print("\nREFUSED %d update(s): the document found for the sample does not carry "
+              "the gold these SQLs were judged against. Writing them would attach one "
+              "sample's references to another. First few:" % len(mismatches))
+        for m in mismatches[:5]:
+            print("  sample_id=%s db_id=%s document _id=%s\n     eval gold: %s\n     doc  gold: %s"
+                  % (m["sample_id"], m["db_id"], m["document_id"],
+                     m["eval_gold"][:160], m["document_gold"][:160]))
+    stats["mismatch_examples"] = mismatches[:50]
     return planned, stats
 
 
@@ -204,10 +280,14 @@ def execute_updates(
         final_array = upd.get(FIELD_NAME, [])
         if not isinstance(final_array, list) or len(final_array) == 0:
             continue
-        sample_id = upd["sample_id"]
-        db_id = upd["db_id"]
+        # Write to the document build_planned_updates VERIFIED, addressed by its own
+        # primary key -- never by re-resolving sample_id, which is what mis-addressed
+        # these references in the first place.
+        doc_id = upd.get("document_id")
+        if doc_id is None:
+            continue
         coll.update_one(
-            {"db_id": db_id, "_id": sample_id},
+            {"_id": doc_id},
             {"$set": {FIELD_NAME: final_array}},
             upsert=False,
         )
