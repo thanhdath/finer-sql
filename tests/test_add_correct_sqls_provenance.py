@@ -123,6 +123,53 @@ def test_a_document_whose_gold_disagrees_is_refused():
     assert M.FIELD_NAME not in coll.docs[0]
 
 
+#: A collection whose documents carry NO `sample_id` field at all, so `find_sample_doc`
+#: has nothing to resolve by and falls back to `_id` -- the exact addressing that caused
+#: the defect.  The gold-equality guard must block the wrong write on its own, with no
+#: help from any id field.
+NO_SAMPLE_ID_FIELD = [
+    {"_id": 5849, "db_id": "airline", "dataset_name": "bird",
+     "SQL": "SELECT COUNT(T1.Code) FROM Airports AS T1 INNER JOIN Airlines AS T2 "
+            "ON T1.Code = T2.DEST WHERE T2.FL_DATE = '2018/8/15' "
+            "AND T1.Description = 'Lake Charles, LA: Lake Charles Regional'"},
+    {"_id": 5854, "db_id": "airline", "dataset_name": "bird",
+     "SQL": "SELECT COUNT(*) FROM Airlines WHERE FL_DATE = '2018/8/1' "
+            "AND DEP_DELAY <= 0"},
+]
+
+
+def test_id_fallback_the_guard_alone_blocks_a_wrong_write():
+    """No `sample_id` field anywhere: the `_id` fallback is the only route, and here it
+    happens to be right, so the write lands on the right document."""
+    coll, planned, stats = _plan(NO_SAMPLE_ID_FIELD, [ENTRY_5854])
+    assert len(planned) == 1 and planned[0]["document_id"] == 5854
+    assert stats["entries_gold_mismatch"] == 0
+    M.execute_updates(planned, FakeClient(coll), "mats", "samples")
+    by_id = {d["_id"]: d for d in coll.docs}
+    assert M.FIELD_NAME in by_id[5854] and M.FIELD_NAME not in by_id[5849]
+
+
+def test_id_fallback_with_drifted_ids_is_refused_by_the_guard_alone():
+    """The real defect, with no `sample_id` field to rescue it: the two id spaces are
+    offset by +5, so `_id == sample_id` finds sample 5854's NEIGHBOUR.  Nothing but the
+    gold-equality guard stands between that document and sample 5854's references, and
+    it must be enough: no write, counted as a mismatch."""
+    drifted = [
+        {"_id": 5854, "db_id": "airline", "dataset_name": "bird",
+         "SQL": "SELECT COUNT(T1.Code) FROM Airports AS T1 INNER JOIN Airlines AS T2 "
+                "ON T1.Code = T2.DEST WHERE T2.FL_DATE = '2018/8/20' "
+                "AND T1.Description = 'Denver, CO: Denver International'"},
+        {"_id": 5859, "db_id": "airline", "dataset_name": "bird",
+         "SQL": ENTRY_5854["ground_truth_sql"]},
+    ]
+    coll, planned, stats = _plan(drifted, [ENTRY_5854])
+    assert planned == [], "the _id neighbour must not be written to"
+    assert stats["entries_gold_mismatch"] == 1
+    M.execute_updates(planned, FakeClient(coll), "mats", "samples")
+    for d in coll.docs:
+        assert M.FIELD_NAME not in d, "no document may receive these references"
+
+
 def test_missing_document_is_counted_not_guessed():
     coll, planned, stats = _plan([], [ENTRY_5854])
     assert planned == [] and stats["entries_no_document"] == 1
