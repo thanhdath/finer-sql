@@ -75,6 +75,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--no-memory", action="store_true", help="Disable memory/intrinsic reward")
     ap.add_argument("--no-atomic", action="store_true", help="Disable atomic operations reward")
     ap.add_argument("--filter-empty-gt", action="store_true", help="Filter out training samples with empty ground truth SQL execution results")
+    ap.add_argument("--allow-empty-gt-match", action="store_true",
+                    help="LEGACY/REPRODUCTION ONLY: let a gold with zero rows certify a prediction "
+                         "that also returns zero rows. Off by default -- a gold that errored is cached "
+                         "as an empty row list by pre-2026-09-21 caches, so such a 'match' pays full "
+                         "execution reward for SELECT ... WHERE 1=0.")
     ap.add_argument("--max_prompt_length", type=int, default=2048, help="Maximum prompt length in tokens")
     # Atomic reward shaping function parameters (S3: e=0.05, beta=0.79, gamma=0.20)
     ap.add_argument("--atomic-e", type=float, default=0.05, help="Atomic reward shaping: weight on linear term (default: 0.05 for S3)")
@@ -120,6 +125,7 @@ ONLY_SAME_DB_RETRIEVAL = getattr(ARGS, 'only_same_db_retrieval', False)
 NO_MEMORY = ARGS.no_memory
 NO_ATOMIC = ARGS.no_atomic
 MAX_PROMPT_LEN = ARGS.max_prompt_length
+ALLOW_EMPTY_GT_MATCH = getattr(ARGS, "allow_empty_gt_match", False)
 ATOMIC_E = ARGS.atomic_e
 ATOMIC_BETA = ARGS.atomic_beta
 ATOMIC_GAMMA = ARGS.atomic_gamma
@@ -128,20 +134,110 @@ ATOMIC_OPS_REWARD = AtomicOpsReward(dialect="sqlite", e=ATOMIC_E, beta=ATOMIC_BE
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 
+# ──────────────────── GOLD USABILITY (reward correctness gate) ────────────────────
+# A cached ground truth can be in one of four states.  Only the first can ever
+# certify a prediction:
+#
+#   list, non-empty            -> a real result set; compare rows
+#   dict {"gold_error": True}  -> the gold SQL did NOT execute (post-2026-09-21 caches)
+#   dict {"timeout": True}     -> the gold SQL timed out
+#   list, empty ([])           -> AMBIGUOUS.  build_gt_cache.py used to write `[]` for a
+#                                 gold that raised, so `[]` means EITHER "no rows" OR
+#                                 "this gold is broken".  Either way it cannot certify:
+#                                 dataframes_equal([], pred_rows) is True for ANY
+#                                 prediction that returns zero rows, so the old code paid
+#                                 exec_score 2.0 for `SELECT <col> FROM <t> WHERE 1=0` on
+#                                 every such prompt (330 of them are BIRD retail_world,
+#                                 whose golds reference `Order Details`, `Territories`,
+#                                 `EmployeeTerritories` and `Customers.CompanyName` --
+#                                 objects BIRD's own train release does not ship).
+GOLD_OK = "ok"
+GOLD_ERROR = "gold_error"
+GOLD_TIMEOUT = "gold_timeout"
+GOLD_EMPTY = "gold_empty"
+GOLD_MISSING = "gold_missing"
+
+
+def classify_gold(gt_rows: Any) -> str:
+    """Classify a GT-cache value. Only GOLD_OK may be compared against a prediction."""
+    if gt_rows is None:
+        return GOLD_MISSING
+    if isinstance(gt_rows, dict):
+        if gt_rows.get("timeout") is True:
+            return GOLD_TIMEOUT
+        if gt_rows.get("gold_error") is True:
+            return GOLD_ERROR
+        rows = gt_rows.get("rows")
+        if not isinstance(rows, list) or len(rows) == 0:
+            return GOLD_EMPTY
+        return GOLD_OK
+    if isinstance(gt_rows, list):
+        return GOLD_EMPTY if len(gt_rows) == 0 else GOLD_OK
+    return GOLD_MISSING
+
+
+def gold_may_certify(gt_rows: Any) -> bool:
+    """True iff this gold is allowed to mark a prediction correct."""
+    kind = classify_gold(gt_rows)
+    if kind == GOLD_OK:
+        return True
+    if kind == GOLD_EMPTY and ALLOW_EMPTY_GT_MATCH:
+        return True
+    return False
+
+
+def _gold_guard_selftest() -> None:
+    """Startup self-test -- runs in production, not only under pytest.
+
+    Guards the exact defect this replaced: an errored/empty gold used to match any
+    prediction that returned zero rows and collect the full execution reward.
+    """
+    assert gold_may_certify([{"a": 1}]) is True, "a real gold must be able to certify"
+    assert gold_may_certify({"gold_error": True, "error": "no such table: Order"}) is False, \
+        "a gold that did not execute must never certify a prediction"
+    assert gold_may_certify({"timeout": True}) is False, \
+        "a gold that timed out must never certify a prediction"
+    assert gold_may_certify(None) is False, "a gold absent from the cache must never certify"
+    if not ALLOW_EMPTY_GT_MATCH:
+        assert gold_may_certify([]) is False, \
+            "an empty gold must never certify unless --allow-empty-gt-match is given"
+
+
+_gold_guard_selftest()
+
 # Load GT cache if provided
 _GT_CACHE: Optional[Dict[tuple, List[Dict[str, Any]]]] = None
 _TIMEOUT_ENTRIES: set = set()  # Track which entries are timeouts
+_GOLD_ERROR_ENTRIES: set = set()  # Golds that did not execute when the cache was built
+_EMPTY_GT_ENTRIES: set = set()    # Golds cached with zero rows (ambiguous in old caches)
 if GT_CACHE_PATH and os.path.exists(GT_CACHE_PATH):
     with open(GT_CACHE_PATH, "rb") as f:
         _GT_CACHE = pickle.load(f)
-    # Identify timeout entries in the cache
+    # Identify timeout / gold-error / empty entries in the cache
     if _GT_CACHE is not None:
         for key, value in _GT_CACHE.items():
-            if isinstance(value, dict) and value.get("timeout") is True:
+            kind = classify_gold(value)
+            if kind == GOLD_TIMEOUT:
                 _TIMEOUT_ENTRIES.add(key)
-    if DEBUG:
-        print(f"[gt_cache] Loaded {len(_GT_CACHE) if _GT_CACHE else 0} entries from {GT_CACHE_PATH}")
-        print(f"[gt_cache] Found {len(_TIMEOUT_ENTRIES)} timeout entries")
+            elif kind == GOLD_ERROR:
+                _GOLD_ERROR_ENTRIES.add(key)
+            elif kind == GOLD_EMPTY:
+                _EMPTY_GT_ENTRIES.add(key)
+    # UNCONDITIONAL (not DEBUG-gated): this census is the log line an operator greps to
+    # see how much of the corpus can never be scored on this endpoint.
+    print(f"[gt_cache] Loaded {len(_GT_CACHE) if _GT_CACHE else 0} entries from {GT_CACHE_PATH}")
+    print(f"[gt_cache] gold_timeout={len(_TIMEOUT_ENTRIES)} "
+          f"gold_error={len(_GOLD_ERROR_ENTRIES)} "
+          f"gold_empty={len(_EMPTY_GT_ENTRIES)} "
+          f"allow_empty_gt_match={ALLOW_EMPTY_GT_MATCH}")
+    _unusable = len(_TIMEOUT_ENTRIES) + len(_GOLD_ERROR_ENTRIES) + (
+        0 if ALLOW_EMPTY_GT_MATCH else len(_EMPTY_GT_ENTRIES))
+    print(f"[gt_cache] {_unusable} cached golds CANNOT certify a prediction "
+          f"(reward 0 for every rollout on those prompts)")
+    if _EMPTY_GT_ENTRIES and not _GOLD_ERROR_ENTRIES:
+        print("[gt_cache] NOTE: this cache predates the gold_error marker -- a gold that "
+              "failed to execute is stored as an empty row list and is counted under "
+              "gold_empty above. Rebuild with build_gt_cache.py to separate the two.")
 
 # Note: messages are already saved in HF dataset; we render to text at load time
 # ─────────────────────── INTRINSIC REWARD (MEMORY) ───────────────────────
@@ -492,6 +588,17 @@ def check_sql_correct(dataset_name: str, db_id: str, predicted_sql: str, ground_
     if isinstance(gt_rows, dict) and gt_rows.get("timeout") is True:
         return {"ok": False, "pred_res": pred_res, "gt_res": {"ok": False, "rows": None, "error": f"GT SQL timed out: {gt_rows.get('error', 'Unknown timeout')}"}}
 
+    # A gold that did not execute -- or that returned no row at all -- cannot certify
+    # anything.  Comparing against it used to hand exec_score 2.0 to any prediction that
+    # also returned zero rows (dataframes_equal(empty, empty) is True), which is a free
+    # full reward for `SELECT <col> FROM <table> WHERE 1=0`.  Reward 0, never a match.
+    if not gold_may_certify(gt_rows):
+        kind = classify_gold(gt_rows)
+        detail = gt_rows.get("error", "") if isinstance(gt_rows, dict) else ""
+        return {"ok": False, "pred_res": pred_res, "gold_unusable": kind,
+                "gt_res": {"ok": False, "rows": None,
+                           "error": f"GOLD UNUSABLE ({kind}): {detail or 'gold cannot certify a prediction'}"}}
+
     ok = dataframes_equal(_rows_to_dataframe(gt_rows), _rows_to_dataframe(pred_res.get("rows")))
     return {"ok": ok, "pred_res": pred_res, "gt_res": {"ok": True, "rows": gt_rows}}
 
@@ -506,9 +613,11 @@ FORMAT_BONUS_W = 1.0
 
 
 _reward_call_count = 0  # tracks reward_fn invocations for periodic sample logging
+_gold_unusable_rollouts = 0   # rollouts scored against a gold that cannot certify
+_gold_unusable_kinds: Dict[str, int] = {}
 
 def reward_fn(prompts, completions, **kwargs):
-    global _reward_call_count
+    global _reward_call_count, _gold_unusable_rollouts
     _reward_call_count += 1
 
     gt_sqls: List[List[str]] = kwargs["groundtruth_sqls"]
@@ -545,6 +654,18 @@ def reward_fn(prompts, completions, **kwargs):
             if pred_res_obj and pred_res_obj.get("api_dead"):
                 api_dead = True
                 print(f"[API] Training stopped due to API being dead. Waiting for recovery...")
+
+            # A gold that cannot certify pays 0 for the whole execution component --
+            # no exact-match credit, no "able to execute" credit, no atomic-ops credit
+            # (the latter two live in the elif branch below, which gt_res.ok=False closes).
+            if verdict.get("gold_unusable"):
+                kind = verdict["gold_unusable"]
+                _gold_unusable_rollouts += 1
+                _gold_unusable_kinds[kind] = _gold_unusable_kinds.get(kind, 0) + 1
+                if _gold_unusable_rollouts == 1 or _gold_unusable_rollouts % 500 == 0:
+                    print(f"[gold_guard] {_gold_unusable_rollouts} rollouts scored 0 on an "
+                          f"unusable gold so far; by kind: {_gold_unusable_kinds} "
+                          f"(latest {dset}/{db_id})")
 
             # Compute similarity score even if not exact-equal:
             # - need pred_res ok and GT rows present in cache

@@ -169,7 +169,8 @@ def main() -> None:
             if key in existing_cache:
                 cache_entry = existing_cache[key]
                 if isinstance(cache_entry, list) or (
-                    isinstance(cache_entry, dict) and cache_entry.get("timeout")
+                    isinstance(cache_entry, dict)
+                    and (cache_entry.get("timeout") or cache_entry.get("gold_error"))
                 ):
                     skipped_existing += 1
                     continue
@@ -193,6 +194,8 @@ def main() -> None:
     skipped = 0
     timeouts = 0
     timeout_entries = []  # Store timeout details for logging
+    gold_errors = 0
+    gold_error_entries = []  # Golds that failed to execute (NOT empty results)
     SAVE_EVERY = 5000  # Checkpoint every N processed entries
 
     def _save_cache():
@@ -259,9 +262,25 @@ def main() -> None:
                         })
                         print(f"Timeout for query {processed} (db_id: {key[1]}): {error_msg}")
                     else:
-                        # Cache negative result to avoid re-querying repeatedly
-                        cache[key] = []
-                        print(f"Failed query {processed}: {error_msg}")
+                        # A gold that does NOT execute must be recorded AS an error.
+                        # It used to be cached as `[]`, i.e. as "this gold returns no
+                        # row" -- indistinguishable from a gold that legitimately
+                        # returns zero rows.  The reward path then compared `[]`
+                        # against the prediction's rows and called ANY prediction that
+                        # returned zero rows a match (grpo_writer.dataframes_equal),
+                        # paying full execution reward for `SELECT ... WHERE 1=0` on
+                        # every prompt whose gold is broken (330 BIRD retail_world
+                        # golds reference tables BIRD's own release does not ship).
+                        cache[key] = {"gold_error": True, "error": error_msg}
+                        gold_errors += 1
+                        gold_error_entries.append({
+                            "dataset_name": key[0],
+                            "db_id": key[1],
+                            "sql": key[2],
+                            "error": error_msg,
+                            "processed": processed,
+                        })
+                        print(f"GOLD_ERROR query {processed} (db_id: {key[1]}): {error_msg}")
                 
                 total += 1
                 processed += 1
@@ -281,6 +300,41 @@ def main() -> None:
     print(f"New entries processed: {total}")
     print(f"Skipped (missing fields): {skipped}")
     print(f"Timeouts in this run: {timeouts}")
+    print(f"Gold execution errors in this run: {gold_errors}")
+
+    # Cache-wide census, so a re-run over an already-complete cache still reports it.
+    n_gold_error = sum(
+        1 for v in cache.values() if isinstance(v, dict) and v.get("gold_error") is True
+    )
+    n_timeout = sum(
+        1 for v in cache.values() if isinstance(v, dict) and v.get("timeout") is True
+    )
+    n_empty_list = sum(1 for v in cache.values() if isinstance(v, list) and len(v) == 0)
+    print(
+        f"[gt_cache] census: {len(cache)} entries | gold_error={n_gold_error} "
+        f"| timeout={n_timeout} | empty-row-list={n_empty_list}"
+    )
+    if n_empty_list:
+        print(
+            "[gt_cache] WARNING: empty-row-list entries are AMBIGUOUS -- a cache built "
+            "before this fix stored a failed gold the same way as a gold that returns "
+            "no row.  grpo_writer refuses a match on both unless --allow-empty-gt-match."
+        )
+
+    if gold_error_entries:
+        gold_error_log_file = f"{args.out}_gold_errors.log"
+        with open(gold_error_log_file, "w") as f:
+            f.write(f"Gold Execution Error Log - {len(gold_error_entries)} golds did not execute\n")
+            f.write("=" * 80 + "\n\n")
+            for i, entry in enumerate(gold_error_entries, 1):
+                f.write(f"Gold error #{i}:\n")
+                f.write(f"  Processed: {entry['processed']}\n")
+                f.write(f"  Dataset: {entry['dataset_name']}\n")
+                f.write(f"  DB ID: {entry['db_id']}\n")
+                f.write(f"  SQL: {entry['sql']}\n")
+                f.write(f"  Error: {entry['error']}\n")
+                f.write("-" * 80 + "\n\n")
+        print(f"Gold error details logged to: {gold_error_log_file}")
     
     # Log timeout details to file
     if timeout_entries:
