@@ -66,6 +66,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--data_seed", type=int, default=None,
                     help="Seed of the training-prompt order (TRL RepeatSampler). Default None = use --seed, which is "
                          "exactly TRL's own behaviour (its sampler is seeded with args.seed).")
+    ap.add_argument("--resume_from_checkpoint", default=None,
+                    help="Continue from this full TRL checkpoint dir (model, optimizer.pt, scheduler.pt, rng_state.pth, "
+                         "trainer_state.json): passed to trainer.train(resume_from_checkpoint=<dir>), so global_step/"
+                         "optimizer/scheduler/RNG are restored and the first global_step prompts of the seeded order are "
+                         "skipped (HF ignore_data_skip=False -> accelerate skip_first_batches). The LR schedule is "
+                         "re-created for --max_steps and the restored optimizer's LR is set to it at train begin. "
+                         "Default None = unchanged behaviour (auto-resume only from <out_dir>/checkpoint-*).")
+    ap.add_argument("--memory_snapshot_init", default=None,
+                    help="Seed the memory (Chroma) store: copy this snapshot dir (e.g. checkpoint-N/"
+                         "memory_snapshot_near_stepN) to --chroma_path before the store is opened. The snapshot itself is "
+                         "never opened. --chroma_path must not exist or be empty. Default None = unchanged behaviour.")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--gt_cache", default="/home/htdat/codes/data/gt_rows_cache.pkl", help="Path to pickle of cached GT rows {(dataset, db_id, sql): rows}")
     ap.add_argument("--api_max_wait_time", type=int, default=300, help="Max time to wait for API recovery (seconds)")
@@ -259,6 +270,44 @@ def _get_intrinsic():
     if _INTRINSIC is None:
         _INTRINSIC = IntrinsicRewardComputer(CHROMA_PATH, CHROMA_COLLECTION)
     return _INTRINSIC
+
+
+def seed_memory_store(snapshot_dir: str, chroma_path: str) -> Dict[str, Any]:
+    """Copy a memory snapshot into an empty/non-existent chroma_path (the snapshot is only read, never opened by
+    chromadb). sqlite side files (-wal/-shm/-journal) are not copied. Returns a small record with sha256s."""
+    import hashlib, json as _json, shutil
+    src = os.path.abspath(snapshot_dir)
+    dst = os.path.abspath(chroma_path)
+    if not os.path.isfile(os.path.join(src, "chroma.sqlite3")):
+        raise SystemExit(f"[memory_init] no chroma.sqlite3 in snapshot {src}")
+    if os.path.exists(dst) and (not os.path.isdir(dst) or os.listdir(dst)):
+        raise SystemExit(f"[memory_init] --chroma_path {dst} exists and is not empty; refusing to mix stores")
+    if src == dst or dst.startswith(src + os.sep) or src.startswith(dst + os.sep):
+        raise SystemExit("[memory_init] snapshot and --chroma_path overlap")
+    def _sha(f):
+        h = hashlib.sha256()
+        with open(f, "rb") as fh:
+            for b in iter(lambda: fh.read(1 << 20), b""):
+                h.update(b)
+        return h.hexdigest()
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    if os.path.isdir(dst):
+        os.rmdir(dst)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("*-wal", "*-shm", "*-journal"))
+    files = sorted(os.path.relpath(os.path.join(r, f), dst) for r, _, fs in os.walk(dst) for f in fs)
+    rec = {"snapshot": src, "chroma_path": dst, "n_files": len(files),
+           "chroma_sqlite3_sha256_src": _sha(os.path.join(src, "chroma.sqlite3")),
+           "chroma_sqlite3_sha256_dst": _sha(os.path.join(dst, "chroma.sqlite3"))}
+    assert rec["chroma_sqlite3_sha256_src"] == rec["chroma_sqlite3_sha256_dst"]
+    print(f"[memory_init] seeded {dst} from {src}: {len(files)} files, chroma.sqlite3 sha256 "
+          f"{rec['chroma_sqlite3_sha256_dst']}")
+    with open(dst.rstrip(os.sep) + ".memory_init.json", "w") as f:
+        _json.dump(rec, f, indent=1)
+    return rec
+
+
+if ARGS.memory_snapshot_init:
+    seed_memory_store(ARGS.memory_snapshot_init, CHROMA_PATH)
 _get_intrinsic()
 
 # ───────────────────────── DATASET BUILDING ───────────────────────
@@ -973,6 +1022,57 @@ def write_train_order(trainer, out_dir: str, max_steps: int) -> Optional[Dict[st
         return None
 
 
+def make_resume_schedule_callback(record_path: Optional[str] = None):
+    """TrainerCallback for --resume_from_checkpoint: HF re-creates the LR scheduler for the new max_steps and then
+    loads scheduler.pt (last_epoch = resumed global_step; the lambda itself is not saved), but the optimizer's
+    param-group LR comes from optimizer.pt, i.e. the old schedule's value, until the first scheduler.step(). At train
+    begin set every group's LR to the re-created schedule's value at the resumed step and record the resume state."""
+    import json as _json
+    from transformers import TrainerCallback
+
+    class ResumeScheduleCallback(TrainerCallback):
+        def __init__(self):
+            self.record: Optional[Dict[str, Any]] = None
+
+        def on_train_begin(self, args, state, control, optimizer=None, lr_scheduler=None, **kw):
+            sched = lr_scheduler
+            lr_before = [float(g["lr"]) for g in optimizer.param_groups]
+            new = [float(base * lam(sched.last_epoch)) for base, lam in zip(sched.base_lrs, sched.lr_lambdas)]
+            for g, lr in zip(optimizer.param_groups, new):
+                g["lr"] = lr
+            sched._last_lr = list(new)
+            self.record = {"global_step": int(state.global_step), "max_steps": int(state.max_steps),
+                           "scheduler_last_epoch": int(sched.last_epoch), "base_lrs": [float(b) for b in sched.base_lrs],
+                           "lr_from_checkpoint_optimizer": lr_before, "lr_set_at_resume": new,
+                           "lr_scheduler_type": str(args.lr_scheduler_type)}
+            print(f"[resume] global_step={state.global_step} max_steps={state.max_steps} "
+                  f"lr(optimizer.pt)={lr_before} -> lr(re-created schedule)={new}")
+            if record_path and state.is_world_process_zero:
+                with open(record_path, "w") as f:
+                    _json.dump(self.record, f, indent=1)
+
+    return ResumeScheduleCallback()
+
+
+def check_resume_checkpoint(ckpt: str, n_rows: int, generation_batch_size: int, num_generations: int) -> int:
+    """Validate a full TRL checkpoint and that the resumed step is inside the first epoch (HF does not replay the
+    sampler draws of skipped epochs, so a resume past epoch 0 would repeat epoch 0's order). Returns global_step."""
+    import json as _json
+    need = ["trainer_state.json", "optimizer.pt", "scheduler.pt", "rng_state.pth"]
+    miss = [f for f in need if not os.path.isfile(os.path.join(ckpt, f))]
+    if miss:
+        raise SystemExit(f"[resume] {ckpt} is not a full TRL checkpoint, missing {miss}")
+    gs = int(_json.load(open(os.path.join(ckpt, "trainer_state.json")))["global_step"])
+    prompts_per_step = max(1, generation_batch_size // num_generations)
+    steps_per_epoch = n_rows // prompts_per_step
+    if gs >= steps_per_epoch:
+        raise SystemExit(f"[resume] global_step {gs} >= steps per epoch {steps_per_epoch}: unsupported "
+                         f"(the skipped epochs' sampler draws would not be replayed)")
+    print(f"[resume] checkpoint {ckpt}: global_step={gs}, steps/epoch={steps_per_epoch}; the first {gs} prompts "
+          f"of the seed-{SEED if 'SEED' in globals() else '?'} order are skipped")
+    return gs
+
+
 def keep_if_short(ex: Dict[str, Any]) -> bool:
     try:
         if "messages" in ex and ex["messages"]:
@@ -1153,6 +1253,14 @@ def main():
         reward_funcs=reward_fn,
     )
     write_train_order(trainer, OUT_DIR, MAX_STEPS)
+
+    if ARGS.resume_from_checkpoint:
+        ckpt = os.path.abspath(ARGS.resume_from_checkpoint)
+        check_resume_checkpoint(ckpt, len(dataset), training_args.generation_batch_size, NUM_GENERATIONS)
+        os.makedirs(OUT_DIR, exist_ok=True)
+        trainer.add_callback(make_resume_schedule_callback(os.path.join(OUT_DIR, "resume_record.json")))
+        trainer.train(resume_from_checkpoint=ckpt)
+        return
 
     # check if checkpoint exists, output-dir/checkpoint-<step>, use glob
     checkpoint_pattern = os.path.join(OUT_DIR, "checkpoint-*")
