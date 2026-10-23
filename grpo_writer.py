@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--vllm_server_port", type=int, default=8000, help="vLLM server port (server mode)")
     ap.add_argument("--use_liger_kernel", action="store_true", help="Use Liger kernel for ~20%% speed and memory savings")
     ap.add_argument("--vllm-no-sleep", action="store_true", dest="vllm_no_sleep", help="Disable vLLM sleep mode in colocate (faster but needs more GPU headroom)")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Global seed: transformers.set_seed() before data loading/model init and GRPOConfig.seed. "
+                         "Default 42 = TRL/transformers TrainingArguments default, i.e. what every earlier run used.")
+    ap.add_argument("--data_seed", type=int, default=None,
+                    help="Seed of the training-prompt order (TRL RepeatSampler). Default None = use --seed, which is "
+                         "exactly TRL's own behaviour (its sampler is seeded with args.seed).")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--gt_cache", default="/home/htdat/codes/data/gt_rows_cache.pkl", help="Path to pickle of cached GT rows {(dataset, db_id, sql): rows}")
     ap.add_argument("--api_max_wait_time", type=int, default=300, help="Max time to wait for API recovery (seconds)")
@@ -108,6 +114,8 @@ LEARNING_RATE = ARGS.learning_rate
 USE_LIGER_KERNEL = ARGS.use_liger_kernel
 NUM_GENERATIONS = ARGS.num_generations
 LIMIT_SAMPLES = ARGS.limit_samples
+SEED = ARGS.seed
+DATA_SEED = ARGS.data_seed if ARGS.data_seed is not None else ARGS.seed  # resolved prompt-order seed
 MAX_COMPLETION_LENGTH = ARGS.max_completion_length
 USE_VLLM = ARGS.use_vllm
 VLLM_MODE = ARGS.vllm_mode
@@ -854,6 +862,116 @@ class APIAwareGRPOTrainer(GRPOTrainer):
                 # Re-raise non-API errors
                 raise
 
+    def _get_train_sampler(self, dataset=None):
+        """TRL 0.25.1 seeds its RepeatSampler with args.seed and ignores args.data_seed.
+        Keep TRL's sampler (same arguments) and only re-seed it when an explicit, different
+        data_seed is given, so the prompt order is a function of data_seed alone.
+        With data_seed None (default) or == seed this returns TRL's sampler untouched."""
+        sampler = super()._get_train_sampler(dataset)
+        data_seed = getattr(self.args, "data_seed", None)
+        if data_seed is not None and data_seed != self.args.seed and getattr(sampler, "shuffle", False):
+            sampler.seed = data_seed
+            sampler.generator.manual_seed(data_seed)
+        return sampler
+
+
+def train_order_fingerprint(sampler, args, dataset, max_steps: int) -> Dict[str, Any]:
+    """Fingerprint of the prompt order the trainer will see in its first `max_steps` optimizer steps.
+
+    `sampler` must be a FRESH sampler built with the trainer's own arguments
+    (trainer._get_train_sampler() returns a new RepeatSampler with a new generator on every call),
+    so iterating it here does not advance the generator of the sampler used for training.
+    Single-process consumption model (num_processes == 1, the only setting used by these runs):
+    one optimizer step consumes generation_batch_size * gradient_accumulation_steps sampler indices.
+    """
+    import hashlib
+    import json as _json
+    n_rows = len(dataset)
+    G = int(sampler.mini_repeat_count)
+    B = int(sampler.batch_size)
+    R = int(sampler.repeat_count)
+    per_step = int(args.generation_batch_size) * int(args.gradient_accumulation_steps)
+    need = per_step * int(max_steps)
+    epoch_len = len(sampler)
+    if epoch_len == 0:
+        raise RuntimeError(f"sampler is empty (n_rows={n_rows}, prompts per generation={B})")
+    stream_sha = hashlib.sha256()
+    prompts: List[int] = []
+    consumed = 0
+    epochs = 0
+    while consumed < need:
+        epochs += 1
+        pos = 0
+        for idx in sampler:  # one epoch: a new randperm from the (same, advancing) generator
+            if consumed >= need:
+                break
+            if pos % (G * B * R) < G * B and pos % G == 0:
+                prompts.append(int(idx))
+            stream_sha.update(int(idx).to_bytes(8, "little", signed=True))
+            pos += 1
+            consumed += 1
+    cols = dataset.column_names
+    def _pair(i: int):
+        row = dataset[int(i)]
+        return [row.get("dataset_name") if "dataset_name" in cols else None,
+                row.get("sample_id") if "sample_id" in cols else None]
+    ids_sha = hashlib.sha256()
+    if "dataset_name" in cols and "sample_id" in cols:
+        names = dataset["dataset_name"]
+        sids = dataset["sample_id"]
+        for i in prompts:
+            ids_sha.update(_json.dumps([names[i], sids[i]]).encode() + b"\n")
+        ids_hex = ids_sha.hexdigest()
+    else:
+        ids_hex = None
+    idx_sha = hashlib.sha256(_json.dumps(prompts).encode()).hexdigest()
+    return {
+        "seed": int(args.seed),
+        "data_seed": (None if getattr(args, "data_seed", None) is None else int(args.data_seed)),
+        "sampler_seed": (None if sampler.seed is None else int(sampler.seed)),
+        "shuffle": bool(sampler.shuffle),
+        "n_rows": int(n_rows),
+        "num_generations": G,
+        "prompts_per_generation_batch": B,
+        "repeat_count": R,
+        "per_device_train_batch_size": int(args.per_device_train_batch_size),
+        "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+        "steps_per_generation": int(args.steps_per_generation),
+        "generation_batch_size": int(args.generation_batch_size),
+        "num_iterations": int(getattr(args, "num_iterations", 1)),
+        "max_steps": int(max_steps),
+        "sampler_indices_per_step": per_step,
+        "epoch_step_aligned": bool(epoch_len % per_step == 0),
+        "epochs_touched": epochs,
+        "n_prompts": len(prompts),
+        "first_64_indices": prompts[:64],
+        "first_32_pairs": [_pair(i) for i in prompts[:32]],
+        "prompt_index_sha256": idx_sha,
+        "prompt_id_sha256": ids_hex,
+        "sampler_stream_sha256": stream_sha.hexdigest(),
+    }
+
+
+def write_train_order(trainer, out_dir: str, max_steps: int) -> Optional[Dict[str, Any]]:
+    """Write <out_dir>/train_order.json. Read-only w.r.t. training: builds a separate sampler."""
+    import json as _json
+    if not trainer.accelerator.is_main_process:
+        return None
+    try:
+        fp = train_order_fingerprint(trainer._get_train_sampler(), trainer.args, trainer.train_dataset, max_steps)
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "train_order.json"), "w") as f:
+            _json.dump(fp, f, indent=1)
+        print(f"[train_order] seed={fp['seed']} data_seed={fp['data_seed']} sampler_seed={fp['sampler_seed']} "
+              f"n_rows={fp['n_rows']} n_prompts={fp['n_prompts']} max_steps={fp['max_steps']}")
+        print(f"[train_order] first 10 (dataset_name, sample_id): {fp['first_32_pairs'][:10]}")
+        print(f"[train_order] prompt_index_sha256={fp['prompt_index_sha256']} "
+              f"prompt_id_sha256={fp['prompt_id_sha256']}")
+        return fp
+    except Exception as e:  # never let the fingerprint stop a run
+        print(f"[train_order] FAILED to write fingerprint: {type(e).__name__}: {e}")
+        return None
+
 
 def keep_if_short(ex: Dict[str, Any]) -> bool:
     try:
@@ -989,6 +1107,9 @@ def init_model():
     return model
 
 def main():
+    from transformers import set_seed
+    set_seed(SEED)
+    print(f"[seed] seed={SEED} data_seed(arg)={ARGS.data_seed} resolved prompt-order seed={DATA_SEED}")
     dataset = load_training_dataset()
     dataset = apply_all_filters(dataset)
     assert len(dataset) > 0
@@ -1021,6 +1142,8 @@ def main():
         vllm_server_port=ARGS.vllm_server_port,
         vllm_enable_sleep_mode=(VLLM_MODE == "colocate" and not ARGS.vllm_no_sleep),
         use_liger_kernel=USE_LIGER_KERNEL,
+        seed=SEED,
+        data_seed=ARGS.data_seed,
     ) 
 
     trainer = APIAwareGRPOTrainer(
@@ -1029,6 +1152,7 @@ def main():
         train_dataset=dataset,
         reward_funcs=reward_fn,
     )
+    write_train_order(trainer, OUT_DIR, MAX_STEPS)
 
     # check if checkpoint exists, output-dir/checkpoint-<step>, use glob
     checkpoint_pattern = os.path.join(OUT_DIR, "checkpoint-*")
