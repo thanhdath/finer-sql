@@ -77,6 +77,10 @@ def parse_args() -> argparse.Namespace:
                     help="Seed the memory (Chroma) store: copy this snapshot dir (e.g. checkpoint-N/"
                          "memory_snapshot_near_stepN) to --chroma_path before the store is opened. The snapshot itself is "
                          "never opened. --chroma_path must not exist or be empty. Default None = unchanged behaviour.")
+    ap.add_argument("--log_sample_ids", action="store_true",
+                    help="Print one '[sample_ids]' line per reward call with the unique (dataset_name, sample_id) "
+                         "pairs it scores (proof of the prompt order, e.g. after --resume_from_checkpoint). "
+                         "Logging only; default off = unchanged behaviour.")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--gt_cache", default="/home/htdat/codes/data/gt_rows_cache.pkl", help="Path to pickle of cached GT rows {(dataset, db_id, sql): rows}")
     ap.add_argument("--api_max_wait_time", type=int, default=300, help="Max time to wait for API recovery (seconds)")
@@ -680,6 +684,9 @@ def reward_fn(prompts, completions, **kwargs):
     gt_sqls: List[List[str]] = kwargs["groundtruth_sqls"]
     db_ids: List[str] = kwargs["db_id"]
     datasets: List[str] = kwargs["dataset_name"]
+    if ARGS.log_sample_ids:
+        _ids = list(dict.fromkeys(zip(datasets, kwargs.get("sample_id") or [None] * len(datasets))))
+        print(f"[sample_ids] call={_reward_call_count} n={len(completions)} ids={_ids}", flush=True)
 
     rewards: List[float] = []
 
