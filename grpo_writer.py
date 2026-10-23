@@ -8,6 +8,7 @@ import argparse
 import time
 import random
 import glob
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -820,6 +821,18 @@ def reward_fn(prompts, completions, **kwargs):
         _DUMP.flush(None, None)     # a previous batch missed its flush point: write it without step/advantage
     sample_ids = kwargs.get("sample_id") or [None] * len(completions)
 
+    # [ORI05F speed] value-preserving: run the unchanged check_sql_correct for every
+    # completion with a non-empty extracted SQL concurrently, then consume in order.
+    _verdicts: List[Optional[Dict[str, Any]]] = [None] * len(completions)
+    with ThreadPoolExecutor(16) as _pool:
+        _futs = {}
+        for _j, (_comp, _gt, _db, _ds) in enumerate(zip(completions, gt_sqls, db_ids, datasets)):
+            _psql = extract_sql_from_completion(_comp)
+            if _psql:
+                _futs[_j] = _pool.submit(check_sql_correct, _ds, _db, _psql, _gt[0])
+        for _j, _f in _futs.items():
+            _verdicts[_j] = _f.result()
+
     for i, (comp, gt_sql, db_id, dset) in enumerate(zip(completions, gt_sqls, db_ids, datasets)):
         pred_sql = extract_sql_from_completion(comp)
         atomic_val = 0.0
@@ -837,7 +850,7 @@ def reward_fn(prompts, completions, **kwargs):
         verdict: Optional[Dict[str, Any]] = None
 
         if pred_sql:
-            verdict = check_sql_correct(dset, db_id, pred_sql, gt_sql[0])
+            verdict = _verdicts[i]
             pred_res_obj = verdict.get("pred_res")
             gt_res_obj = verdict.get("gt_res")
 
