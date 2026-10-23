@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--vllm_server_port", type=int, default=8000, help="vLLM server port (server mode)")
     ap.add_argument("--use_liger_kernel", action="store_true", help="Use Liger kernel for ~20%% speed and memory savings")
     ap.add_argument("--vllm-no-sleep", action="store_true", dest="vllm_no_sleep", help="Disable vLLM sleep mode in colocate (faster but needs more GPU headroom)")
+    ap.add_argument("--per_device_train_batch_size", type=int, default=1, help="[CORE05F2 speed] micro-batch size; default 1 = original behaviour")
+    ap.add_argument("--loss_type", default=None, choices=["grpo", "bnpo", "dr_grpo", "dapo"], help="[CORE05F2 speed] TRL loss_type; default None = TRL default (dapo) = original behaviour")
     ap.add_argument("--seed", type=int, default=42,
                     help="Global seed: transformers.set_seed() before data loading/model init and GRPOConfig.seed. "
                          "Default 42 = TRL/transformers TrainingArguments default, i.e. what every earlier run used.")
@@ -1387,7 +1389,8 @@ def main():
         learning_rate=LEARNING_RATE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
         num_generations=NUM_GENERATIONS,
-        per_device_train_batch_size=1,
+        per_device_train_batch_size=ARGS.per_device_train_batch_size,
+        **({"loss_type": ARGS.loss_type} if ARGS.loss_type else {}),
         per_device_eval_batch_size=1,
         max_prompt_length=MAX_PROMPT_LEN,
         max_completion_length=MAX_COMPLETION_LENGTH,
