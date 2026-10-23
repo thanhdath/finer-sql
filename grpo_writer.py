@@ -106,6 +106,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--atomic-e", type=float, default=0.05, help="Atomic reward shaping: weight on linear term (default: 0.05 for S3)")
     ap.add_argument("--atomic-beta", type=float, default=0.79, help="Atomic reward shaping: beta coefficient (default: 0.79 for S3)")
     ap.add_argument("--atomic-gamma", type=float, default=0.20, help="Atomic reward shaping: gamma exponent (default: 0.20 for S3)")
+    ap.add_argument("--atomic_canon", default="v1", choices=["v1", "v2"],
+                    help="Op extractor of the atomic term. v1 (default) = atomic_ops/atomic_ops.py as before. v2 = atomic_ops/ops_v2.py: "
+                         "alias-resolved canonical ops (same Jaccard, same max over the reference list, same shaping, same activation).")
+    ap.add_argument("--atomic_ops_file", default=None,
+                    help="With --atomic_canon v2: JSON from tools/build_atomic_oplists.py holding the precomputed v2 op sets of the gold and "
+                         "references of every prompt (keyed by dataset_name/sample_id) plus the database schemas; prompts missing from the "
+                         "file fall back to extracting their reference list at runtime (cached).")
+    ap.add_argument("--dump_rollouts", default=None,
+                    help="Append one JSON line per scored rollout to this path: step, dataset_name, sample_id, db_id, sql, every reward "
+                         "term (format, ex, executable, atomic, memory), total, verdict and the group-relative advantage TRL computed "
+                         "for it. Default off; training is unchanged.")
     # GRPO training stability knobs
     ap.add_argument("--beta", type=float, default=0.04, help="KL divergence penalty coefficient (default: 0.04). Lower = more exploration, e.g. 0.001 for expert config")
     ap.add_argument("--warmup_ratio", type=float, default=0.0, help="Fraction of steps to linearly warm up LR from 0 (e.g. 0.03 = 3%% of max_steps)")
@@ -154,6 +165,120 @@ ATOMIC_BETA = ARGS.atomic_beta
 ATOMIC_GAMMA = ARGS.atomic_gamma
 
 ATOMIC_OPS_REWARD = AtomicOpsReward(dialect="sqlite", e=ATOMIC_E, beta=ATOMIC_BETA, gamma=ATOMIC_GAMMA)
+ATOMIC_CANON = ARGS.atomic_canon
+ATOMIC_OPS_FILE = ARGS.atomic_ops_file
+DUMP_ROLLOUTS = ARGS.dump_rollouts
+
+# ───────────────────── ATOMIC CANON v2 (opt-in; v1 path untouched) ─────────────────────
+_V2_OPSETS: Dict[Any, List[set]] = {}      # (dataset_name, sample_id) -> [set(gold ops), set(ref ops), ...]
+_V2_SCHEMAS: Dict[str, Dict[str, List[str]]] = {}
+_V2_EXTRACTORS: Dict[str, Any] = {}
+_V2_RUNTIME_CACHE: Dict[Any, List[set]] = {}
+_V2_STATS = {"prebuilt": 0, "runtime": 0, "pred_parse_fail": 0}
+if ATOMIC_CANON == "v2":
+    from atomic_ops.ops_v2 import OpExtractor as _V2Extractor, OpParseError as _V2ParseError, jaccard as _v2_jaccard, load_ops_file as _v2_load
+    if ATOMIC_OPS_FILE:
+        _V2_OPSETS, _V2_SCHEMAS, _v2_meta = _v2_load(ATOMIC_OPS_FILE)
+        print(f"[atomic_v2] ops file {ATOMIC_OPS_FILE}: prompts {len(_V2_OPSETS)} schemas {len(_V2_SCHEMAS)} "
+              f"meta {{rows: {_v2_meta.get('rows')}, references: {_v2_meta.get('references')}, opsets: {_v2_meta.get('opsets')}, "
+              f"parquet_sha256: {str(_v2_meta.get('parquet_sha256'))[:16]}}}")
+    else:
+        print("[atomic_v2] no --atomic_ops_file: reference op sets are extracted at runtime (no schema: unqualified columns stay unqualified)")
+
+
+def _v2_extractor(dataset_name: str, db_id: str):
+    key = f"{dataset_name}:{db_id}"
+    ex = _V2_EXTRACTORS.get(key)
+    if ex is None:
+        ex = _V2Extractor(_V2_SCHEMAS.get(key))
+        _V2_EXTRACTORS[key] = ex
+    return ex
+
+
+def atomic_score_v2(pred_sql: str, dataset_name: str, db_id: str, sample_id: Any, gt_sqls: List[str]) -> float:
+    """Same rule as AtomicOpsReward.score_against_list (max over references of the shaped Jaccard; a side that does not
+    parse is an empty set; an empty union scores 0), with v2 canonical op sets. Reference op sets come from the ops
+    file when the prompt is there, else from extracting gt_sqls once (cached)."""
+    ex = _v2_extractor(dataset_name, db_id)
+    try:
+        pred_ops = ex.keys(pred_sql)
+    except _V2ParseError:
+        pred_ops = set()
+        _V2_STATS["pred_parse_fail"] += 1
+    opsets = _V2_OPSETS.get((dataset_name, sample_id))
+    if opsets is not None:
+        _V2_STATS["prebuilt"] += 1
+    else:
+        ck = (dataset_name, db_id, tuple(gt_sqls or []))
+        opsets = _V2_RUNTIME_CACHE.get(ck)
+        if opsets is None:
+            opsets = []
+            for s_ in (gt_sqls or []):
+                try:
+                    opsets.append(ex.keys(s_))
+                except _V2ParseError:
+                    opsets.append(set())
+            _V2_RUNTIME_CACHE[ck] = opsets
+        _V2_STATS["runtime"] += 1
+    best = 0.0
+    for ref_ops in opsets:
+        sc = ATOMIC_OPS_REWARD.execution_weighted_jaccard(_v2_jaccard(pred_ops, ref_ops))
+        if sc > best:
+            best = sc
+    return float(best)
+
+
+# ───────────────────── ROLLOUT DUMP (opt-in; one JSONL line per scored rollout) ─────────────────────
+class _RolloutDump:
+    """reward_fn appends one record per rollout to `pending`; the trainer flushes them after TRL has computed the
+    advantages of the same generation batch (same completion order), adding step and advantage. If a flush point is
+    missed the records are written at the next reward call with step/advantage None. A write failure never reaches the
+    reward."""
+
+    def __init__(self, path: str):
+        import json as _json
+        self.json = _json
+        self.path = path
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        self.fh = open(path, "a", buffering=1)
+        self.pending: List[Dict[str, Any]] = []
+        self.written = 0
+        self.misaligned = 0
+        self.errors = 0
+
+    def add(self, rec: Dict[str, Any]) -> None:
+        self.pending.append(rec)
+
+    def flush(self, step: Optional[int] = None, advantages=None) -> None:
+        recs, self.pending = self.pending, []
+        if not recs:
+            return
+        adv = None
+        if advantages is not None:
+            try:
+                adv = [float(x) for x in advantages.detach().cpu().flatten().tolist()] if hasattr(advantages, "detach") else [float(x) for x in advantages]
+            except Exception:
+                adv = None
+        if adv is not None and len(adv) != len(recs):
+            self.misaligned += 1
+            adv = None
+        for k, r in enumerate(recs):
+            r["step"] = step
+            r["advantage"] = (adv[k] if adv is not None else None)
+            try:
+                self.fh.write(self.json.dumps(r, default=str) + "\n")
+                self.written += 1
+            except Exception:
+                self.errors += 1
+        try:
+            self.fh.flush()
+        except Exception:
+            pass
+
+
+_DUMP: Optional[_RolloutDump] = _RolloutDump(DUMP_ROLLOUTS) if DUMP_ROLLOUTS else None
+if _DUMP is not None:
+    print(f"[dump_rollouts] every scored rollout -> {DUMP_ROLLOUTS} (step/advantage filled after TRL's advantage computation)")
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 
@@ -689,9 +814,14 @@ def reward_fn(prompts, completions, **kwargs):
         print(f"[sample_ids] call={_reward_call_count} n={len(completions)} ids={_ids}", flush=True)
 
     rewards: List[float] = []
+    if _DUMP is not None and _DUMP.pending:
+        _DUMP.flush(None, None)     # a previous batch missed its flush point: write it without step/advantage
+    sample_ids = kwargs.get("sample_id") or [None] * len(completions)
 
     for i, (comp, gt_sql, db_id, dset) in enumerate(zip(completions, gt_sqls, db_ids, datasets)):
         pred_sql = extract_sql_from_completion(comp)
+        atomic_val = 0.0
+        executable_val = 0.0
 
         # format bonus (kept from your original logic)
         thought, correct_format = has_format_bonus(comp)
@@ -702,6 +832,7 @@ def reward_fn(prompts, completions, **kwargs):
         pred_res_obj: Optional[Dict[str, Any]] = None
         gt_res_obj: Optional[Dict[str, Any]] = None
         api_dead = False
+        verdict: Optional[Dict[str, Any]] = None
 
         if pred_sql:
             verdict = check_sql_correct(dset, db_id, pred_sql, gt_sql[0])
@@ -737,12 +868,17 @@ def reward_fn(prompts, completions, **kwargs):
                 exec_score = 2.0
             elif pred_res_obj and pred_res_obj.get("ok") and gt_res_obj and gt_res_obj.get("ok"):
                 exec_score += 1.0 # able to execute
+                executable_val = 1.0
                 # exec_score += _EXEC_SCORER.score_from_rows(
                 #     gt_rows=gt_res_obj.get("rows"),
                 #     pred_rows=pred_res_obj.get("rows"),
                 # )
                 if not NO_ATOMIC:
-                    exec_score += ATOMIC_OPS_REWARD.score_against_list(pred_sql, gt_sql)
+                    if ATOMIC_CANON == "v2":
+                        atomic_val = atomic_score_v2(pred_sql, dset, db_id, sample_ids[i], gt_sql)
+                    else:
+                        atomic_val = ATOMIC_OPS_REWARD.score_against_list(pred_sql, gt_sql)
+                    exec_score += atomic_val
 
         thought_reward = 0
         if not NO_MEMORY:
@@ -878,6 +1014,16 @@ def reward_fn(prompts, completions, **kwargs):
             print(f"[/SAMPLE]\n")
 
         rewards.append(float(total))
+        if _DUMP is not None:
+            _DUMP.add({"call": _reward_call_count, "index": i, "dataset_name": dset, "sample_id": sample_ids[i], "db_id": db_id,
+                       "sql": pred_sql, "format": float(format_reward), "ex": (2.0 if exec_score >= 2.0 else 0.0),
+                       "executable": float(executable_val), "atomic": float(atomic_val), "memory": float(thought_reward),
+                       "exec_score": float(exec_score), "total": float(total),
+                       "verdict_ok": bool(pred_res_obj is not None and exec_score >= 2.0),
+                       "pred_ok": (None if pred_res_obj is None else bool(pred_res_obj.get("ok"))),
+                       "pred_error": (None if pred_res_obj is None or pred_res_obj.get("ok") else str(pred_res_obj.get("error"))[:200]),
+                       "gold_unusable": (verdict.get("gold_unusable") if verdict else None),
+                       "ts": time.time()})
 
     return rewards
 
@@ -917,6 +1063,18 @@ class APIAwareGRPOTrainer(GRPOTrainer):
             else:
                 # Re-raise non-API errors
                 raise
+
+    def _generate_and_score_completions(self, inputs):
+        """--dump_rollouts: after TRL scored a generation batch, write the pending rollout records with the trainer's
+        global_step and the advantages of the same batch (same completion order). No-op when the flag is off."""
+        out = super()._generate_and_score_completions(inputs)
+        if _DUMP is not None:
+            try:
+                adv = out.get("advantages") if isinstance(out, dict) else None
+                _DUMP.flush(int(self.state.global_step), adv)
+            except Exception as e:  # never let logging reach the training step
+                print(f"[dump_rollouts] flush failed: {type(e).__name__}: {e}")
+        return out
 
     def _get_train_sampler(self, dataset=None):
         """TRL 0.25.1 seeds its RepeatSampler with args.seed and ignores args.data_seed.
