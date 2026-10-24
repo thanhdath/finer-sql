@@ -30,3 +30,8 @@ config and tokenizer) for evaluation. It is not written to the top level, becaus
 The HF backup script `hf_backup_arm.py` line 104 asserts `model.safetensors`, so it fails on LoRA checkpoints. To fix
 it, accept `adapter_model.safetensors` (plus `merged/model.safetensors`) when `adapter_config.json` is present. Its
 extension allowlist already covers both files.
+
+## Spurious penalty (opt-in, 2026-10-24)
+| flag | effect |
+|---|---|
+| `--spurious_penalty --ori_api_url URL --ori_gt_cache PATH` | CoRE arm only. Every rollout with an SQL is also judged on the original DB (same `check_sql_correct` comparator, submitted to the same 16-thread pool in the same pass). Paid on the arm's DB: unchanged (exec_score 2.0). Not paid on the arm's DB (with a usable gold there) but paid on the original DB: spurious, exec_score 0.0, atomic 0.0, executable 0.0; format and memory are computed as usual from exec_score 0 (unpaid memory path). Otherwise unchanged (1 + atomic if executable). The dyn mask sees a spurious rollout as unpaid. Dump adds `ori_ok` and `spurious`; logs `spur/share` (spurious / rollouts per generation batch) and `spur/groups` (groups with at least one spurious rollout). Both ORI flags are required when it is on. Tests: `tests/test_spurious_penalty.py`. |

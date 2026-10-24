@@ -161,6 +161,14 @@ def parse_args() -> argparse.Namespace:
                     help="'all-linear' (default, every linear layer except lm_head) or a comma list, e.g. q_proj,v_proj")
     ap.add_argument("--lora_no_merged_export", action="store_true",
                     help="LoRA: do not write checkpoint-N/merged/ (full merged weights for eval)")
+    # [spurious penalty 2026-10-24] opt-in; off = original reward
+    ap.add_argument("--spurious_penalty", action="store_true",
+                    help="CoRE arm: also judge every rollout on the ORIGINAL DB (--ori_api_url, --ori_gt_cache; same comparator, "
+                         "same thread pool). Paid on the original DB but not on the arm's DB = spurious: exec_score 0, atomic 0 "
+                         "(no executable/distance credit); format and memory terms computed as usual from that exec_score. "
+                         "Dump gets ori_ok/spurious, logs spur/share and spur/groups. Default off = original behaviour.")
+    ap.add_argument("--ori_api_url", default=None, help="--spurious_penalty: db_execution endpoint of the original DB")
+    ap.add_argument("--ori_gt_cache", default=None, help="--spurious_penalty: GT rows cache pickle built on the original DB")
     return ap.parse_args()
 
 
@@ -289,6 +297,11 @@ ATOMIC_OPS_REWARD = AtomicOpsReward(dialect="sqlite", e=ATOMIC_E, beta=ATOMIC_BE
 ATOMIC_CANON = ARGS.atomic_canon
 ATOMIC_OPS_FILE = ARGS.atomic_ops_file
 DUMP_ROLLOUTS = ARGS.dump_rollouts
+SPURIOUS_PENALTY = bool(getattr(ARGS, "spurious_penalty", False))
+ORI_API_URL = getattr(ARGS, "ori_api_url", None)
+_LAST_SPUR: List[bool] = []   # spurious flag of the last reward call, completion order; filled only with --spurious_penalty
+if SPURIOUS_PENALTY and not (ORI_API_URL and ARGS.ori_gt_cache and os.path.exists(ARGS.ori_gt_cache)):
+    raise SystemExit("[spurious] --spurious_penalty needs --ori_api_url and an existing --ori_gt_cache")
 
 # ───────────────────── ATOMIC CANON v2 (opt-in; v1 path untouched) ─────────────────────
 _V2_OPSETS: Dict[Any, List[set]] = {}      # (dataset_name, sample_id) -> [set(gold ops), set(ref ops), ...]
@@ -775,7 +788,7 @@ def is_select_like(sql: str) -> bool:
     return s.startswith("select") or s.startswith("with") or s.startswith("explain")
 
 
-def call_sql_api(dataset_name: str, db_id: str, sql: str, *, mode: Optional[str] = None, timeout_ms: Optional[int] = None, max_rows: Optional[int] = None) -> Dict[str, Any]:
+def call_sql_api(dataset_name: str, db_id: str, sql: str, *, mode: Optional[str] = None, timeout_ms: Optional[int] = None, max_rows: Optional[int] = None, api_url: Optional[str] = None) -> Dict[str, Any]:
     """Call the mats SQL executor API and return full response dict.
 
     mode: if None, auto: 'read_only' for SELECT/CTE/EXPLAIN, else 'sandbox_rollback'.
@@ -784,10 +797,11 @@ def call_sql_api(dataset_name: str, db_id: str, sql: str, *, mode: Optional[str]
     req_mode = mode or ("read_only" if is_select_like(sql) else "sandbox_rollback")
     tm = TIMEOUT_MS if timeout_ms is None else timeout_ms
     mr = MAX_ROWS if max_rows is None else max_rows
+    url = API_URL if api_url is None else api_url
     
     try:
         resp = requests.post(
-            API_URL,
+            url,
             json={
                 "dataset_name": dataset_name,
                 "db_id": db_id,
@@ -828,12 +842,12 @@ def call_sql_api(dataset_name: str, db_id: str, sql: str, *, mode: Optional[str]
         if is_api_dead_error(error_msg):
             print(f"[API] Detected API dead error: {error_msg}")
             print(f"[API] Attempting to wait for API recovery...")
-            if wait_for_api_recovery(API_URL):
+            if wait_for_api_recovery(url):
                 print(f"[API] API recovered, retrying request...")
                 # Retry the request once after recovery
                 try:
                     resp = requests.post(
-                        API_URL,
+                        url,
                         json={
                             "dataset_name": dataset_name,
                             "db_id": db_id,
@@ -893,22 +907,37 @@ def dataframes_equal(true_df: Optional[pd.DataFrame], pred_df: Optional[pd.DataF
     return true_set == pred_set
 
 
+_ORI_GT_CACHE: Optional[Dict[tuple, Any]] = None
+if SPURIOUS_PENALTY:
+    with open(ARGS.ori_gt_cache, "rb") as f:
+        _ORI_GT_CACHE = pickle.load(f)
+    print(f"[spurious] penalty ON: second verdict on {ORI_API_URL} with {len(_ORI_GT_CACHE)} GT entries from {ARGS.ori_gt_cache}")
+
+
+def is_spurious(core_v: Optional[Dict[str, Any]], ori_v: Optional[Dict[str, Any]]) -> bool:
+    """--spurious_penalty: paid on the original DB, not paid on the arm's (CoRE) DB whose gold can certify."""
+    return bool(ori_v is not None and ori_v.get("ok") and core_v is not None and not core_v.get("ok")
+                and not core_v.get("gold_unusable"))
+
+
 # ────────────────────── CORRECTNESS CHECK (separate) ──────────────────────
-def check_sql_correct(dataset_name: str, db_id: str, predicted_sql: str, ground_truth_sql: str) -> Dict[str, Any]:
+def check_sql_correct(dataset_name: str, db_id: str, predicted_sql: str, ground_truth_sql: str,
+                      api_url: Optional[str] = None, gt_cache: Optional[Dict[tuple, Any]] = None) -> Dict[str, Any]:
     """Execute predicted and ground-truth SQL via API and compare row-level results.
 
     Returns dict with keys: ok (bool), pred_res (dict), gt_res (dict).
     ok=True iff both calls succeed and rows_equal(pred, gt).
     """
-    pred_res = call_sql_api(dataset_name, db_id, predicted_sql)
+    pred_res = call_sql_api(dataset_name, db_id, predicted_sql, api_url=api_url)
     if not pred_res.get("ok"):
         return {"ok": False, "pred_res": pred_res, "gt_res": None}
 
     # Use cached GT rows rather than executing during training
-    if _GT_CACHE is None:
+    cache = _GT_CACHE if gt_cache is None else gt_cache
+    if cache is None:
         return {"ok": False, "pred_res": pred_res, "gt_res": {"ok": False, "rows": None, "error": "No GT cache loaded"}}
     key = (dataset_name, db_id, ground_truth_sql)
-    gt_rows = _GT_CACHE.get(key)
+    gt_rows = cache.get(key)
     if gt_rows is None:
         return {"ok": False, "pred_res": pred_res, "gt_res": {"ok": False, "rows": None, "error": "GT rows not in cache"}}
     
@@ -965,14 +994,23 @@ def reward_fn(prompts, completions, **kwargs):
     # [ORI05F speed] value-preserving: run the unchanged check_sql_correct for every
     # completion with a non-empty extracted SQL concurrently, then consume in order.
     _verdicts: List[Optional[Dict[str, Any]]] = [None] * len(completions)
+    _ori_verdicts: List[Optional[Dict[str, Any]]] = [None] * len(completions)
     with ThreadPoolExecutor(16) as _pool:
         _futs = {}
+        _ori_futs = {}
         for _j, (_comp, _gt, _db, _ds) in enumerate(zip(completions, gt_sqls, db_ids, datasets)):
             _psql = extract_sql_from_completion(_comp)
             if _psql:
                 _futs[_j] = _pool.submit(check_sql_correct, _ds, _db, _psql, _gt[0])
+                if SPURIOUS_PENALTY:
+                    _ori_futs[_j] = _pool.submit(check_sql_correct, _ds, _db, _psql, _gt[0], ORI_API_URL, _ORI_GT_CACHE)
         for _j, _f in _futs.items():
             _verdicts[_j] = _f.result()
+        for _j, _f in _ori_futs.items():
+            _ori_verdicts[_j] = _f.result()
+    _spur = [is_spurious(_v, _o) for _v, _o in zip(_verdicts, _ori_verdicts)] if SPURIOUS_PENALTY else [False] * len(completions)
+    if SPURIOUS_PENALTY:
+        _LAST_SPUR[:] = _spur
 
     # [reward-speed --atomic_memo] atomic term of every executable-but-not-paid rollout, scored up front (same condition
     # as in the loop below: verdict not ok, pred executed, gold usable).
@@ -980,7 +1018,7 @@ def reward_fn(prompts, completions, **kwargs):
     if (getattr(ARGS, "atomic_memo", False) or getattr(ARGS, "memory_fast", False)) and not NO_ATOMIC and ATOMIC_CANON == "v2":
         _idx, _items = [], []
         for _j, _v in enumerate(_verdicts):
-            if _v is None or _v.get("ok"):
+            if _v is None or _v.get("ok") or _spur[_j]:
                 continue
             _pr, _gr = _v.get("pred_res"), _v.get("gt_res")
             if _pr and _pr.get("ok") and _gr and _gr.get("ok"):
@@ -1001,6 +1039,8 @@ def reward_fn(prompts, completions, **kwargs):
             if _v is not None:
                 if _v.get("ok"):
                     _es = 2.0
+                elif _spur[_j]:
+                    _es = 0.0
                 elif _v.get("pred_res") and _v["pred_res"].get("ok") and _v.get("gt_res") and _v["gt_res"].get("ok"):
                     _es = 1.0 + (0.0 if NO_ATOMIC else _atomic_pre[_j])
             it = {"reward_text": None, "save": None, "save_text": None, "dataset_name": datasets[_j], "db_id": db_ids[_j],
@@ -1090,6 +1130,8 @@ def reward_fn(prompts, completions, **kwargs):
             # - need pred_res ok and GT rows present in cache
             if verdict.get("ok"):
                 exec_score = 2.0
+            elif _spur[i]:
+                exec_score = 0.0   # [--spurious_penalty] paid only on the original DB: no executable/atomic credit
             elif pred_res_obj and pred_res_obj.get("ok") and gt_res_obj and gt_res_obj.get("ok"):
                 exec_score += 1.0 # able to execute
                 executable_val = 1.0
@@ -1256,6 +1298,10 @@ def reward_fn(prompts, completions, **kwargs):
                        "pred_error": (None if pred_res_obj is None or pred_res_obj.get("ok") else str(pred_res_obj.get("error"))[:200]),
                        "gold_unusable": (verdict.get("gold_unusable") if verdict else None),
                        "ts": time.time()})
+            if SPURIOUS_PENALTY:
+                _o = _ori_verdicts[i]
+                _DUMP.pending[-1]["ori_ok"] = (None if _o is None else bool(_o.get("ok")))
+                _DUMP.pending[-1]["spurious"] = bool(_spur[i])
 
     if getattr(ARGS, "memory_embed_batch", False) and not NO_MEMORY and _mem_fast is None:
         _get_intrinsic().clear_embedding_cache()
@@ -1345,6 +1391,11 @@ class APIAwareGRPOTrainer(GRPOTrainer):
         """--dump_rollouts: after TRL scored a generation batch, write the pending rollout records with the trainer's
         global_step and the advantages of the same batch (same completion order). No-op when the flag is off."""
         out = super()._generate_and_score_completions(inputs)
+        if globals().get("SPURIOUS_PENALTY") and self.model.training and _LAST_SPUR:   # globals(): tests exec this class alone
+            _sp = list(_LAST_SPUR)
+            _g = self.num_generations
+            self._metrics["train"]["spur/share"].append(sum(_sp) / len(_sp))
+            self._metrics["train"]["spur/groups"].append(float(sum(any(_sp[k:k + _g]) for k in range(0, len(_sp), _g))))
         dyn_masked = None
         if self._dyn_mode == "mask" and self.model.training:
             out, dyn_masked = self._apply_dyn_mask(out)
