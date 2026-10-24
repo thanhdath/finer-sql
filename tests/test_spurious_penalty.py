@@ -31,6 +31,12 @@ ORI_API = os.environ.get("ORI_API_URL", "http://127.0.0.1:18231/execute")
 GOLD = "SELECT COUNT(questiontext) FROM Question"
 SPUR = "SELECT COUNT(*) FROM Question"
 WRONG = "SELECT COUNT(*) FROM Answer"
+# CoRE-paid but ORI-wrong (symmetric_population.json, student_loan 4405): the bundle's base member is the compact D0, where
+# one student has the max month; on the original DB 90 do.
+CO_DB = "student_loan"
+CO_GOLD = "SELECT name FROM longest_absense_from_school WHERE `month` = ( SELECT MAX(month) FROM longest_absense_from_school )"
+CO_SQL = "SELECT DISTINCT longest_absense_from_school.name\nFROM longest_absense_from_school\nORDER BY longest_absense_from_school.month DESC\nLIMIT 1;"
+CO_WRONG = "SELECT name FROM longest_absense_from_school WHERE `month` = 0"
 
 
 def _exec(url, sql, db="mental_health_survey"):
@@ -56,16 +62,16 @@ import grpo_writer as G
 OK = {"ok": True, "rows": [{"a": 1}]}
 def fake(ds, db, sql, gt, api_url=None, gt_cache=None):
     ori = api_url is not None
-    paid = sql == "PAID" or (ori and sql == "SPUR")
+    paid = sql == "PAID" or (sql == "SPUR" if ori else sql == "CORE_ONLY")
     return {"ok": paid, "pred_res": OK, "gt_res": OK}
 G.check_sql_correct = fake
 G.ATOMIC_OPS_REWARD.score_against_list = lambda p, g: 0.25
 th = "<think>\n" + "x" * 120 + "\n</think>\n"
-r = G.reward_fn(["p"] * 3, [th + "PAID", th + "SPUR", th + "WRONG"], groundtruth_sqls=[["G"]] * 3, db_id=["d"] * 3,
-                dataset_name=["bird"] * 3, sample_id=[1] * 3)
+r = G.reward_fn(["p"] * 4, [th + "PAID", th + "SPUR", th + "WRONG", th + "CORE_ONLY"], groundtruth_sqls=[["G"]] * 4, db_id=["d"] * 4,
+                dataset_name=["bird"] * 4, sample_id=[1] * 4)
 G._DUMP.flush(0, None)
 recs = [json.loads(l) for l in open(os.path.join(out, "r.jsonl"))]
-print("###RESULT###" + json.dumps({"rewards": r, "recs": recs, "last_spur": G._LAST_SPUR}))
+print("###RESULT###" + json.dumps({"rewards": r, "recs": recs, "last_spur": G._LAST_SPUR, "last_core_only": G._LAST_CORE_ONLY}))
 '''
 
 
@@ -80,35 +86,46 @@ def _unit(extra):
     return json.loads(r.stdout.split("###RESULT###")[1].strip().splitlines()[0])
 
 
+ORI = ["--ori_api_url", "http://ori/execute", "--ori_gt_cache", "@ORI"]
+
+
 @pytest.mark.skipif(not os.path.isdir(TOKENIZER), reason="tokenizer dir absent")
-def test_composition_three_cases():
+def test_composition_four_verdict_combinations():
+    # rollouts: PAID (core ok, ori ok), SPUR (core no, ori ok), WRONG (core no, ori no), CORE_ONLY (core ok, ori no)
     off = _unit([])
-    on = _unit(["--spurious_penalty", "--ori_api_url", "http://ori/execute", "--ori_gt_cache", "@ORI"])
-    assert off["rewards"] == [3.0, 2.25, 2.25]                 # format 1 + exec (2 | 1 + 0.25); memory off
-    assert on["rewards"] == [3.0, 1.0, 2.25]                   # spurious: format only
-    p, s, w = on["recs"]
+    on = _unit(["--spurious_penalty"] + ORI)                   # implies --pay_requires_ori_ok
+    assert off["rewards"] == [3.0, 2.25, 2.25, 3.0]            # format 1 + exec (2 | 1 + 0.25); memory off
+    assert on["rewards"] == [3.0, 1.0, 2.25, 2.25]             # spurious: format only; core-only: wrong-executable
+    assert _unit(["--spurious_penalty", "--no_pay_requires_ori_ok"] + ORI)["rewards"] == [3.0, 1.0, 2.25, 3.0]
+    assert _unit(["--pay_requires_ori_ok"] + ORI)["rewards"] == [3.0, 2.25, 2.25, 2.25]
+    p, s, w, c = on["recs"]
+    assert (c["exec_score"], c["atomic"], c["executable"], c["ex"], c["verdict_ok"], c["core_ok"], c["ori_ok"], c["spurious"]) == \
+           (1.25, 0.25, 1.0, 0.0, False, True, False, False)
+    assert (p["core_ok"], s["core_ok"], w["core_ok"]) == (True, False, False)
+    assert on["last_core_only"] == [False, False, False, True]
+    on = dict(on, recs=on["recs"][:3], rewards=on["rewards"][:3]); off = dict(off, recs=off["recs"][:3])
     assert (s["exec_score"], s["atomic"], s["executable"], s["ex"], s["spurious"], s["ori_ok"]) == (0.0, 0.0, 0.0, 0.0, True, True)
     assert (p["spurious"], p["ori_ok"], p["exec_score"]) == (False, True, 2.0)
     assert (w["spurious"], w["ori_ok"], w["exec_score"], w["atomic"]) == (False, False, 1.25, 0.25)
-    assert on["last_spur"] == [False, True, False]
+    assert on["last_spur"] == [False, True, False, False]
     assert all("spurious" not in r and "ori_ok" not in r for r in off["recs"])
-    drop = ("ts", "spurious", "ori_ok")
+    drop = ("ts", "spurious", "ori_ok", "core_ok")
     assert [{k: v for k, v in r.items() if k not in drop} for r in (on["recs"][0], on["recs"][2])] == \
            [{k: v for k, v in r.items() if k not in drop} for r in (off["recs"][0], off["recs"][2])]
 
 
-def _e2e(spurious):
+def _e2e(spurious, db="mental_health_survey", gold=GOLD, sqls=(GOLD, SPUR, WRONG, SPUR + ";")):
     out = tempfile.mkdtemp(prefix="spur_e2e_")
     caches = {}
     for name, url in (("core", CORE_API), ("ori", ORI_API)):
         caches[name] = os.path.join(out, f"gt_{name}.pkl")
-        pickle.dump({("bird", "mental_health_survey", GOLD): _exec(url, GOLD)["rows"]}, open(caches[name], "wb"))
+        pickle.dump({("bird", db, gold): _exec(url, gold, db)["rows"]}, open(caches[name], "wb"))
     w = E.WORKER
     w = w.replace('SQLS = ["SELECT COUNT(*) FROM CBSA", "SELECT COUNT(CBSA) FROM CBSA", "SELECT COUNT(*) FROM CBSA WHERE CBSA > 0", "SELECT CBSA FROM CBSA LIMIT 1"]',
-                  f'SQLS = [{GOLD!r}, {SPUR!r}, {WRONG!r}, {SPUR + ";"!r}]')
-    w = w.replace('"db_id": "address"', '"db_id": "mental_health_survey"').replace(
-        '"groundtruth_sqls": ["SELECT COUNT(*) FROM CBSA", "SELECT COUNT(CBSA) FROM CBSA"]', f'"groundtruth_sqls": [{GOLD!r}, {SPUR!r}]')
-    assert SPUR in w and "mental_health_survey" in w
+                  f'SQLS = {list(sqls)!r}')
+    w = w.replace('"db_id": "address"', f'"db_id": {db!r}').replace(
+        '"groundtruth_sqls": ["SELECT COUNT(*) FROM CBSA", "SELECT COUNT(CBSA) FROM CBSA"]', f'"groundtruth_sqls": [{gold!r}]')
+    assert repr(sqls[1]) in w and repr(db) in w
     extra = ["--spurious_penalty", "--ori_api_url", ORI_API, "--ori_gt_cache", caches["ori"]] if spurious else []
     env = dict(os.environ, REPO=REPO, OUT=out, CACHE=caches["core"], API_URL=CORE_API, TOKENIZER=TOKENIZER, CUDA_VISIBLE_DEVICES="",
                EXTRA=json.dumps(extra))
@@ -137,5 +154,27 @@ def test_e2e_live_apis():
             if kind == "paid":
                 assert a["total"] == b["total"] == 4.0
             else:
-                assert 1.0 < a["exec_score"] < 2.0
+                assert a["executable"] == 1.0 and 1.0 <= a["exec_score"] < 2.0
     assert "spur/share" in log and "spur/groups" in log
+
+
+@pytest.mark.skipif(not (_up(CORE_API) and _up(ORI_API)), reason="CoRE/original db_execution APIs not reachable")
+@pytest.mark.skipif(not os.path.isdir(TOKENIZER), reason="tokenizer dir absent")
+def test_e2e_core_paid_ori_wrong_is_unpaid():
+    sqls = (CO_GOLD, CO_SQL, CO_WRONG, CO_SQL)
+    _, off = _e2e(False, CO_DB, CO_GOLD, sqls)
+    log, on = _e2e(True, CO_DB, CO_GOLD, sqls)
+    assert len(on) == len(off) == 16
+    for a, b in zip(on, off):
+        kind = {CO_GOLD: "paid", CO_WRONG: "wrong"}.get(a["sql"], "core_only")
+        assert a["sql"] == b["sql"] and a["spurious"] is False
+        if kind == "core_only":
+            assert (b["ex"], b["exec_score"], b["total"]) == (2.0, 2.0, 4.0)      # flag off: CoRE pays it
+            assert (a["core_ok"], a["ori_ok"], a["ex"], a["executable"], a["verdict_ok"]) == (True, False, 0.0, 1.0, False)
+            assert 1.0 <= a["exec_score"] < 2.0 and a["exec_score"] == 1.0 + a["atomic"]
+            assert a["total"] == a["format"] + a["exec_score"] + a["memory"]
+        else:
+            assert (a["core_ok"], a["ori_ok"]) == ((True, True) if kind == "paid" else (False, False))
+            for k in ("format", "ex", "executable", "atomic", "exec_score", "verdict_ok"):
+                assert a[k] == b[k], (kind, k)
+    assert "spur/core_only" in log

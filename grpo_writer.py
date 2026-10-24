@@ -169,6 +169,13 @@ def parse_args() -> argparse.Namespace:
                          "Dump gets ori_ok/spurious, logs spur/share and spur/groups. Default off = original behaviour.")
     ap.add_argument("--ori_api_url", default=None, help="--spurious_penalty: db_execution endpoint of the original DB")
     ap.add_argument("--ori_gt_cache", default=None, help="--spurious_penalty: GT rows cache pickle built on the original DB")
+    ap.add_argument("--pay_requires_ori_ok", dest="pay_requires_ori_ok", action="store_true", default=None,
+                    help="Paid only if paid on the arm's DB AND on the original DB (needs --ori_api_url/--ori_gt_cache). Paid on the "
+                         "arm's DB but executed and mismatched on the original DB -> wrong-executable (1 + atomic, unpaid memory "
+                         "path); dump core_ok/ori_ok, log spur/core_only. An original-DB execution error/timeout keeps the arm's "
+                         "verdict. Default: on iff --spurious_penalty.")
+    ap.add_argument("--no_pay_requires_ori_ok", dest="pay_requires_ori_ok", action="store_false",
+                    help="With --spurious_penalty: do not require the original-DB verdict for payment.")
     return ap.parse_args()
 
 
@@ -298,10 +305,14 @@ ATOMIC_CANON = ARGS.atomic_canon
 ATOMIC_OPS_FILE = ARGS.atomic_ops_file
 DUMP_ROLLOUTS = ARGS.dump_rollouts
 SPURIOUS_PENALTY = bool(getattr(ARGS, "spurious_penalty", False))
+_pro = getattr(ARGS, "pay_requires_ori_ok", None)
+PAY_REQUIRES_ORI_OK = SPURIOUS_PENALTY if _pro is None else bool(_pro)
+ORI_PASS = SPURIOUS_PENALTY or PAY_REQUIRES_ORI_OK   # second verdict on the original DB
 ORI_API_URL = getattr(ARGS, "ori_api_url", None)
 _LAST_SPUR: List[bool] = []   # spurious flag of the last reward call, completion order; filled only with --spurious_penalty
-if SPURIOUS_PENALTY and not (ORI_API_URL and ARGS.ori_gt_cache and os.path.exists(ARGS.ori_gt_cache)):
-    raise SystemExit("[spurious] --spurious_penalty needs --ori_api_url and an existing --ori_gt_cache")
+_LAST_CORE_ONLY: List[bool] = []   # paid on the arm's DB, mismatched on the original DB (--pay_requires_ori_ok)
+if ORI_PASS and not (ORI_API_URL and ARGS.ori_gt_cache and os.path.exists(ARGS.ori_gt_cache)):
+    raise SystemExit("[spurious] --spurious_penalty / --pay_requires_ori_ok need --ori_api_url and an existing --ori_gt_cache")
 
 # ───────────────────── ATOMIC CANON v2 (opt-in; v1 path untouched) ─────────────────────
 _V2_OPSETS: Dict[Any, List[set]] = {}      # (dataset_name, sample_id) -> [set(gold ops), set(ref ops), ...]
@@ -908,16 +919,23 @@ def dataframes_equal(true_df: Optional[pd.DataFrame], pred_df: Optional[pd.DataF
 
 
 _ORI_GT_CACHE: Optional[Dict[tuple, Any]] = None
-if SPURIOUS_PENALTY:
+if ORI_PASS:
     with open(ARGS.ori_gt_cache, "rb") as f:
         _ORI_GT_CACHE = pickle.load(f)
-    print(f"[spurious] penalty ON: second verdict on {ORI_API_URL} with {len(_ORI_GT_CACHE)} GT entries from {ARGS.ori_gt_cache}")
+    print(f"[spurious] spurious_penalty={SPURIOUS_PENALTY} pay_requires_ori_ok={PAY_REQUIRES_ORI_OK}: second verdict on {ORI_API_URL} with {len(_ORI_GT_CACHE)} GT entries from {ARGS.ori_gt_cache}")
 
 
 def is_spurious(core_v: Optional[Dict[str, Any]], ori_v: Optional[Dict[str, Any]]) -> bool:
     """--spurious_penalty: paid on the original DB, not paid on the arm's (CoRE) DB whose gold can certify."""
     return bool(ori_v is not None and ori_v.get("ok") and core_v is not None and not core_v.get("ok")
                 and not core_v.get("gold_unusable"))
+
+
+def is_core_only(core_v: Optional[Dict[str, Any]], ori_v: Optional[Dict[str, Any]]) -> bool:
+    """--pay_requires_ori_ok: paid on the arm's DB, but on the original DB the rollout executed against a usable gold and
+    did not match (an original-DB execution error/timeout or an unusable original gold keeps the arm's verdict)."""
+    return bool(core_v is not None and core_v.get("ok") and ori_v is not None and not ori_v.get("ok")
+                and (ori_v.get("pred_res") or {}).get("ok") and (ori_v.get("gt_res") or {}).get("ok"))
 
 
 # ────────────────────── CORRECTNESS CHECK (separate) ──────────────────────
@@ -1002,7 +1020,7 @@ def reward_fn(prompts, completions, **kwargs):
             _psql = extract_sql_from_completion(_comp)
             if _psql:
                 _futs[_j] = _pool.submit(check_sql_correct, _ds, _db, _psql, _gt[0])
-                if SPURIOUS_PENALTY:
+                if ORI_PASS:
                     _ori_futs[_j] = _pool.submit(check_sql_correct, _ds, _db, _psql, _gt[0], ORI_API_URL, _ORI_GT_CACHE)
         for _j, _f in _futs.items():
             _verdicts[_j] = _f.result()
@@ -1011,6 +1029,12 @@ def reward_fn(prompts, completions, **kwargs):
     _spur = [is_spurious(_v, _o) for _v, _o in zip(_verdicts, _ori_verdicts)] if SPURIOUS_PENALTY else [False] * len(completions)
     if SPURIOUS_PENALTY:
         _LAST_SPUR[:] = _spur
+    _core_ok = [bool(_v is not None and _v.get("ok")) for _v in _verdicts]
+    if PAY_REQUIRES_ORI_OK:
+        _co = [is_core_only(_v, _o) for _v, _o in zip(_verdicts, _ori_verdicts)]
+        _LAST_CORE_ONLY[:] = _co
+        # demote to wrong-executable: everything below (atomic pre-pass, memory, loop) sees an unpaid verdict
+        _verdicts = [(dict(_v, ok=False, core_only=True) if _c else _v) for _v, _c in zip(_verdicts, _co)]
 
     # [reward-speed --atomic_memo] atomic term of every executable-but-not-paid rollout, scored up front (same condition
     # as in the loop below: verdict not ok, pred executed, gold usable).
@@ -1298,10 +1322,11 @@ def reward_fn(prompts, completions, **kwargs):
                        "pred_error": (None if pred_res_obj is None or pred_res_obj.get("ok") else str(pred_res_obj.get("error"))[:200]),
                        "gold_unusable": (verdict.get("gold_unusable") if verdict else None),
                        "ts": time.time()})
-            if SPURIOUS_PENALTY:
+            if ORI_PASS:
                 _o = _ori_verdicts[i]
                 _DUMP.pending[-1]["ori_ok"] = (None if _o is None else bool(_o.get("ok")))
                 _DUMP.pending[-1]["spurious"] = bool(_spur[i])
+                _DUMP.pending[-1]["core_ok"] = _core_ok[i]
 
     if getattr(ARGS, "memory_embed_batch", False) and not NO_MEMORY and _mem_fast is None:
         _get_intrinsic().clear_embedding_cache()
@@ -1396,6 +1421,8 @@ class APIAwareGRPOTrainer(GRPOTrainer):
             _g = self.num_generations
             self._metrics["train"]["spur/share"].append(sum(_sp) / len(_sp))
             self._metrics["train"]["spur/groups"].append(float(sum(any(_sp[k:k + _g]) for k in range(0, len(_sp), _g))))
+        if globals().get("PAY_REQUIRES_ORI_OK") and self.model.training:
+            self._metrics["train"]["spur/core_only"].append(float(sum(_LAST_CORE_ONLY)))
         dyn_masked = None
         if self._dyn_mode == "mask" and self.model.training:
             out, dyn_masked = self._apply_dyn_mask(out)
