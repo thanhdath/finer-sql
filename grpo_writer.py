@@ -98,6 +98,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--same-db-retrieval", action="store_true", help="Allow querying memory on the same db_id (not just other db_ids)")
     ap.add_argument("--only-same-db-retrieval", action="store_true", help="Only query memory with db_id=this_id (exclude other db_ids)")
     ap.add_argument("--no-memory", action="store_true", help="Disable memory/intrinsic reward")
+    ap.add_argument("--memory_embed_batch", action="store_true",
+                    help="[reward-speed] memory term: embed the think texts of all rollouts of a reward call in ONE batched request "
+                         "up front and serve the per-rollout embedding calls from it; the Chroma query/add loop stays sequential in "
+                         "the original order. Values differ from the default only by embedding-server float noise (the server is "
+                         "not bit-deterministic even for identical requests). Default off = original behaviour.")
+    ap.add_argument("--atomic_memo", action="store_true",
+                    help="[reward-speed] --atomic_canon v2: score the atomic term of a reward call before the per-rollout loop, "
+                         "extracting the op set of each distinct (dataset, db, SQL) once. Bit-identical values (tools/reward_cpu_replay.py "
+                         "identity). Default off = original behaviour.")
     ap.add_argument("--no-atomic", action="store_true", help="Disable atomic operations reward")
     ap.add_argument("--filter-empty-gt", action="store_true", help="Filter out training samples with empty ground truth SQL execution results")
     ap.add_argument("--allow-empty-gt-match", action="store_true",
@@ -230,6 +239,23 @@ def atomic_score_v2(pred_sql: str, dataset_name: str, db_id: str, sample_id: Any
         if sc > best:
             best = sc
     return float(best)
+
+
+def atomic_scores_v2_batch(items: List[tuple]) -> List[float]:
+    """--atomic_memo: atomic_score_v2 for a list of (pred_sql, dataset_name, db_id, sample_id, gt_sqls), in order, with
+    the same values. Each distinct (dataset_name, db_id, sample_id, pred_sql, gt_sqls) is scored once by atomic_score_v2
+    itself (so the rule, the reference op sets and _V2_STATS per distinct item are unchanged); repeats reuse the value.
+    The score is a pure function of that key (op sets are fixed per prompt), hence bit-identical."""
+    memo: Dict[Any, float] = {}
+    out: List[float] = []
+    for pred_sql, dset, db_id, sid, gts in items:
+        k = (dset, db_id, sid, pred_sql, tuple(gts or []))
+        v = memo.get(k)
+        if v is None:
+            v = atomic_score_v2(pred_sql, dset, db_id, sid, gts)
+            memo[k] = v
+        out.append(v)
+    return out
 
 
 # ───────────────────── ROLLOUT DUMP (opt-in; one JSONL line per scored rollout) ─────────────────────
@@ -834,6 +860,31 @@ def reward_fn(prompts, completions, **kwargs):
         for _j, _f in _futs.items():
             _verdicts[_j] = _f.result()
 
+    # [reward-speed --atomic_memo] atomic term of every executable-but-not-paid rollout, scored up front (same condition
+    # as in the loop below: verdict not ok, pred executed, gold usable).
+    _atomic_pre: Optional[Dict[int, float]] = None
+    if getattr(ARGS, "atomic_memo", False) and not NO_ATOMIC and ATOMIC_CANON == "v2":
+        _idx, _items = [], []
+        for _j, _v in enumerate(_verdicts):
+            if _v is None or _v.get("ok"):
+                continue
+            _pr, _gr = _v.get("pred_res"), _v.get("gt_res")
+            if _pr and _pr.get("ok") and _gr and _gr.get("ok"):
+                _idx.append(_j)
+                _items.append((extract_sql_from_completion(completions[_j]), datasets[_j], db_ids[_j], sample_ids[_j], gt_sqls[_j]))
+        _atomic_pre = dict(zip(_idx, atomic_scores_v2_batch(_items)))
+
+    # [reward-speed --memory_embed_batch] one embedding request for all think texts of this call; the per-rollout
+    # memory calls below read it, Chroma query/add order unchanged.
+    if getattr(ARGS, "memory_embed_batch", False) and not NO_MEMORY:
+        _texts = []
+        for _comp in completions:
+            _th, _ = has_format_bonus(_comp)
+            _t = (_th if _th is not None else _comp.strip()).strip()
+            if _t:
+                _texts.append(_t)
+        _get_intrinsic().prefetch_embeddings(_texts)
+
     for i, (comp, gt_sql, db_id, dset) in enumerate(zip(completions, gt_sqls, db_ids, datasets)):
         pred_sql = extract_sql_from_completion(comp)
         atomic_val = 0.0
@@ -890,7 +941,9 @@ def reward_fn(prompts, completions, **kwargs):
                 #     pred_rows=pred_res_obj.get("rows"),
                 # )
                 if not NO_ATOMIC:
-                    if ATOMIC_CANON == "v2":
+                    if ATOMIC_CANON == "v2" and _atomic_pre is not None:
+                        atomic_val = _atomic_pre[i]
+                    elif ATOMIC_CANON == "v2":
                         atomic_val = atomic_score_v2(pred_sql, dset, db_id, sample_ids[i], gt_sql)
                     else:
                         atomic_val = ATOMIC_OPS_REWARD.score_against_list(pred_sql, gt_sql)
@@ -1041,6 +1094,8 @@ def reward_fn(prompts, completions, **kwargs):
                        "gold_unusable": (verdict.get("gold_unusable") if verdict else None),
                        "ts": time.time()})
 
+    if getattr(ARGS, "memory_embed_batch", False) and not NO_MEMORY:
+        _get_intrinsic().clear_embedding_cache()
     return rewards
 
 # ───────────────────────── TRAINER SETUP ───────────────────────────

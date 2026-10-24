@@ -98,7 +98,22 @@ class IntrinsicRewardComputer:
         return [item.embedding for item in data_sorted]
 
     def _embed_one(self, text: str) -> List[float]:
+        cache = getattr(self, "_emb_cache", None)
+        if cache is not None:
+            hit = cache.get(text)
+            if hit is not None:
+                return hit
         return self._embed_many([text])[0]
+
+    def prefetch_embeddings(self, texts: List[str]) -> int:
+        """--memory_embed_batch: embed the distinct texts in ONE request and serve later _embed_one(text) calls from it
+        until clear_embedding_cache(). A text not prefetched is embedded live as before. Returns the number embedded."""
+        uniq = list(dict.fromkeys(t for t in texts if isinstance(t, str) and t))
+        self._emb_cache = dict(zip(uniq, self._embed_many(uniq))) if uniq else {}
+        return len(uniq)
+
+    def clear_embedding_cache(self) -> None:
+        self._emb_cache = None
 
     def retrieve_similar_reasoning_paths_from_other_db_ids(
         self,
