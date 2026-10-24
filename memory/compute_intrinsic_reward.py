@@ -115,6 +115,168 @@ class IntrinsicRewardComputer:
     def clear_embedding_cache(self) -> None:
         self._emb_cache = None
 
+    # ───────────── --memory_fast: one step of the memory term with batched server/store calls ─────────────
+    @staticmethod
+    def _space(col) -> str:
+        try:
+            cfg = getattr(col, "configuration_json", None) or getattr(col, "configuration", None) or {}
+            sp = (cfg.get("hnsw") or {}).get("space")
+            if sp:
+                return sp
+        except Exception:  # noqa: BLE001
+            pass
+        md = getattr(col, "metadata", None) or {}
+        return md.get("hnsw:space", "l2")
+
+    @staticmethod
+    def _dist(space: str, q: np.ndarray, e: np.ndarray) -> float:
+        if space == "cosine":
+            return float(1.0 - np.dot(q, e) / (np.linalg.norm(q) * np.linalg.norm(e)))
+        if space == "ip":
+            return float(1.0 - np.dot(q, e))
+        d = q - e
+        return float(np.dot(d, d))   # hnswlib l2 = squared euclidean
+
+    @staticmethod
+    def _where_ok(where: Optional[Dict[str, Any]], db_id: str) -> bool:
+        if where is None:
+            return True
+        cond = where["db_id"]
+        if "$ne" in cond:
+            return db_id != cond["$ne"]
+        return db_id == cond["$eq"]
+
+    def memory_fast_step(self, items: List[Dict[str, Any]], top_k: int = 20, same_db_retrieval: bool = False,
+                         only_same_db_retrieval: bool = False) -> Optional[List[Optional[float]]]:
+        """The memory calls of one reward call, same decisions as the sequential path, batched.
+
+        items, in rollout order: {"reward_text": str|None (compute_thought_reward on it), "save": None|"reasoning"|"failed",
+        "save_text": str, "dataset_name", "db_id", "model_name"}. Sequential semantics reproduced:
+          reward  = cosine(emb(text), centroid of the top_k reasoning_paths nearest to emb(text) under the db_id filter)
+                    over the store AS IT IS AT THAT ROLLOUT (step-start store + reasoning adds of earlier rollouts of this
+                    call); 0.0 when nothing is retrieved / norms vanish / any error (as compute_thought_reward).
+          save    = query the target collection for its single nearest entry (no filter) over the store at that rollout;
+                    skip if cosine(emb, nearest) >= 0.9, else add (same id / document / metadata fields).
+        Implementation: ONE embedding request; one batched store query per (collection, filter); a brute-force shadow over
+        this call's earlier adds (same space as the collection) merged with the store result by distance; ONE add per
+        collection at the end, in rollout order. Returns None (caller runs the sequential path) if a batched server/store
+        call fails before any write. Differences vs sequential: embedding float noise (one request instead of 2-3 per
+        rollout) and HNSW approximation of the store part only."""
+        try:
+            texts = []
+            for it in items:
+                if it.get("reward_text"):
+                    texts.append(it["reward_text"])
+                if it.get("save") and it.get("save_text"):
+                    texts.append(it["save_text"])
+            uniq = list(dict.fromkeys(texts))
+            E = dict(zip(uniq, self._embed_many(uniq))) if uniq else {}
+            if only_same_db_retrieval:
+                wf = lambda db: {"db_id": {"$eq": db}}  # noqa: E731
+            elif same_db_retrieval:
+                wf = lambda db: None  # noqa: E731
+            else:
+                wf = lambda db: {"db_id": {"$ne": db}}  # noqa: E731
+            cols = {"reasoning": self.reasoning_collection, "failed": self.failed_collection}
+            space = {k: self._space(c) for k, c in cols.items()}
+
+            def batch_query(col, idx, emb_of, n, where):
+                out = {}
+                if not idx:
+                    return out
+                kw = {"query_embeddings": [emb_of(i) for i in idx], "n_results": n,
+                      "include": ["documents", "metadatas", "distances", "embeddings"]}
+                if where is not None:
+                    kw["where"] = where
+                res = col.query(**kw) or {}
+                for j, i in enumerate(idx):
+                    ids = ((res.get("ids") or [])[j:j + 1] or [[]])[0]
+                    dists = ((res.get("distances") or [])[j:j + 1] or [[]])[0]
+                    embs = (res.get("embeddings") if res.get("embeddings") is not None else [])
+                    embs = embs[j] if len(embs) > j else []
+                    out[i] = [(float(dists[k]), np.asarray(embs[k])) for k in range(len(ids))
+                              if ids[k] is not None and k < len(dists) and k < len(embs) and embs[k] is not None]
+                return out
+
+            by_where: Dict[Any, List[int]] = {}
+            for i, it in enumerate(items):
+                if it.get("reward_text"):
+                    by_where.setdefault(repr(wf(it["db_id"])), []).append(i)
+            store_rew: Dict[int, list] = {}
+            for _, idx in by_where.items():
+                store_rew.update(batch_query(cols["reasoning"], idx, lambda i: E[items[i]["reward_text"]], top_k, wf(items[idx[0]]["db_id"])))
+            store_nn = {}
+            for k in cols:
+                idx = [i for i, it in enumerate(items) if it.get("save") == k and it.get("save_text")]
+                store_nn[k] = batch_query(cols[k], idx, lambda i: E[items[i]["save_text"]], 1, None)
+        except Exception as e:  # noqa: BLE001
+            print(f"[memory_fast] batched call failed ({type(e).__name__}: {e}); sequential path for this step")
+            return None
+
+        shadow: Dict[str, List[tuple]] = {"reasoning": [], "failed": []}   # (db_id, emb32)
+        pending: Dict[str, Dict[str, list]] = {k: {"ids": [], "embeddings": [], "documents": [], "metadatas": []} for k in cols}
+        rewards: List[Optional[float]] = []
+        for i, it in enumerate(items):
+            r = None
+            if it.get("reward_text"):
+                try:
+                    a = np.array(E[it["reward_text"]], dtype=np.float32)
+                    where = wf(it["db_id"])
+                    cand = list(store_rew.get(i, []))
+                    for db, e in shadow["reasoning"]:
+                        if self._where_ok(where, db):
+                            cand.append((self._dist(space["reasoning"], a, e.astype(np.float32)), e))
+                    cand.sort(key=lambda x: x[0])
+                    valid = [e for _, e in cand[:top_k]]
+                    r = 0.0
+                    if valid:
+                        centroid = np.mean(valid, axis=0)
+                        if centroid is not None and not np.isnan(centroid).any():
+                            an, cn = np.linalg.norm(a), np.linalg.norm(centroid)
+                            if an >= 1e-8 and cn >= 1e-8:
+                                v = float(np.dot(a / an, centroid / cn))
+                                r = 0.0 if np.isnan(v) else v
+                except Exception:  # noqa: BLE001
+                    r = 0.0
+            rewards.append(r)
+            k = it.get("save")
+            t = it.get("save_text")
+            if k and t:
+                emb = E[t]
+                a = np.array(emb, dtype=np.float32)
+                cand = list(store_nn[k].get(i, []))
+                for db, e in shadow[k]:
+                    cand.append((self._dist(space[k], a, e.astype(np.float32)), e))
+                skip = False
+                if cand:
+                    top = np.array(min(cand, key=lambda x: x[0])[1], dtype=np.float32)
+                    na, nb = np.linalg.norm(a), np.linalg.norm(top)
+                    if na > 0 and nb > 0 and float(np.dot(a, top) / (na * nb)) >= 0.9:
+                        skip = True
+                if not skip:
+                    uid = self._make_thought_id(it["dataset_name"], it["db_id"], t)
+                    md = {"dataset_name": it["dataset_name"], "model_name": it.get("model_name") or "unknown",
+                          "schema_prompt": "", "reasoning_path": t, "created_at": datetime.utcnow().isoformat(),
+                          "db_id": it["db_id"]}
+                    pk = pending[k]
+                    if uid in pk["ids"]:
+                        continue   # sequential add of an existing id is a no-op
+                    pk["ids"].append(uid); pk["embeddings"].append(emb); pk["documents"].append(t); pk["metadatas"].append(md)
+                    shadow[k].append((it["db_id"], a.astype(np.float64)))   # as the store returns it: float32 values, float64 array
+        for k, pk in pending.items():
+            if not pk["ids"]:
+                continue
+            try:
+                cols[k].add(**pk)
+            except Exception as e:  # noqa: BLE001
+                print(f"[memory_fast] batched add to {k} failed ({type(e).__name__}: {e}); adding one by one")
+                for j in range(len(pk["ids"])):
+                    try:
+                        cols[k].add(ids=[pk["ids"][j]], embeddings=[pk["embeddings"][j]], documents=[pk["documents"][j]], metadatas=[pk["metadatas"][j]])
+                    except Exception as e2:  # noqa: BLE001
+                        print(f"[memory_fast] add failed: {e2}")
+        return rewards
+
     def retrieve_similar_reasoning_paths_from_other_db_ids(
         self,
         thought: str,

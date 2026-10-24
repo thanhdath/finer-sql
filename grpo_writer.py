@@ -103,6 +103,12 @@ def parse_args() -> argparse.Namespace:
                          "up front and serve the per-rollout embedding calls from it; the Chroma query/add loop stays sequential in "
                          "the original order. Values differ from the default only by embedding-server float noise (the server is "
                          "not bit-deterministic even for identical requests). Default off = original behaviour.")
+    ap.add_argument("--memory_fast", action="store_true",
+                    help="[reward-speed] whole memory term of a reward call batched: one embedding request, one store query per "
+                         "(collection, filter) against the store at call start, a brute-force shadow over this call's earlier adds "
+                         "for within-call retrieval/dedup, one add per collection at the end. Same decision rules (top_k centroid "
+                         "reward, 0.9 cosine dedup, quality gate, which rollouts are saved); differences only from embedding "
+                         "float noise and HNSW approximation. Implies the atomic pre-pass of --atomic_memo. Default off.")
     ap.add_argument("--atomic_memo", action="store_true",
                     help="[reward-speed] --atomic_canon v2: score the atomic term of a reward call before the per-rollout loop, "
                          "extracting the op set of each distinct (dataset, db, SQL) once. Bit-identical values (tools/reward_cpu_replay.py "
@@ -863,7 +869,7 @@ def reward_fn(prompts, completions, **kwargs):
     # [reward-speed --atomic_memo] atomic term of every executable-but-not-paid rollout, scored up front (same condition
     # as in the loop below: verdict not ok, pred executed, gold usable).
     _atomic_pre: Optional[Dict[int, float]] = None
-    if getattr(ARGS, "atomic_memo", False) and not NO_ATOMIC and ATOMIC_CANON == "v2":
+    if (getattr(ARGS, "atomic_memo", False) or getattr(ARGS, "memory_fast", False)) and not NO_ATOMIC and ATOMIC_CANON == "v2":
         _idx, _items = [], []
         for _j, _v in enumerate(_verdicts):
             if _v is None or _v.get("ok"):
@@ -874,9 +880,52 @@ def reward_fn(prompts, completions, **kwargs):
                 _items.append((extract_sql_from_completion(completions[_j]), datasets[_j], db_ids[_j], sample_ids[_j], gt_sqls[_j]))
         _atomic_pre = dict(zip(_idx, atomic_scores_v2_batch(_items)))
 
+    # [reward-speed --memory_fast] the memory term of every rollout, decided exactly as in the loop below (exec_score
+    # needs the atomic term: 1 + atomic == 2.0 counts as correct there), computed in one batched pass.
+    _mem_fast: Optional[List[float]] = None
+    if getattr(ARGS, "memory_fast", False) and not NO_MEMORY and (NO_ATOMIC or _atomic_pre is not None):
+        _items, _trs = [], []
+        for _j, _comp in enumerate(completions):
+            _psql = extract_sql_from_completion(_comp)
+            _th, _ = has_format_bonus(_comp)
+            _es = 0.0
+            _v = _verdicts[_j] if _psql else None
+            if _v is not None:
+                if _v.get("ok"):
+                    _es = 2.0
+                elif _v.get("pred_res") and _v["pred_res"].get("ok") and _v.get("gt_res") and _v["gt_res"].get("ok"):
+                    _es = 1.0 + (0.0 if NO_ATOMIC else _atomic_pre[_j])
+            it = {"reward_text": None, "save": None, "save_text": None, "dataset_name": datasets[_j], "db_id": db_ids[_j],
+                  "model_name": os.path.basename(MODEL_PATH)}
+            _tr = 0
+            if _es < 2.0:
+                if _th is None:
+                    _th = _comp.strip()
+                if len(_th) > 30:
+                    it["reward_text"] = _th
+            elif _es == 2.0:
+                _tr = 1.0
+            if _th:
+                _pq = prompts[_j] if isinstance(prompts, list) and _j < len(prompts) else None
+                _ins = False
+                if _pq:
+                    try:
+                        _, _ins = calculate_reasoning_quality(_th, pred_sql=_psql, prompt=_pq, debug=False)
+                    except Exception:
+                        _ins = False
+                if _ins and isinstance(_th, str) and _th.strip():
+                    it["save"] = "reasoning" if _es >= 2.0 else "failed"
+                    it["save_text"] = _th.strip()
+            _items.append(it)
+            _trs.append(_tr)
+        _r = _get_intrinsic().memory_fast_step(_items, top_k=INTRINSIC_TOP_K, same_db_retrieval=SAME_DB_RETRIEVAL,
+                                               only_same_db_retrieval=ONLY_SAME_DB_RETRIEVAL)
+        if _r is not None:
+            _mem_fast = [(_x if _it["reward_text"] else _t) for _x, _it, _t in zip(_r, _items, _trs)]
+
     # [reward-speed --memory_embed_batch] one embedding request for all think texts of this call; the per-rollout
     # memory calls below read it, Chroma query/add order unchanged.
-    if getattr(ARGS, "memory_embed_batch", False) and not NO_MEMORY:
+    if getattr(ARGS, "memory_embed_batch", False) and not NO_MEMORY and _mem_fast is None:
         _texts = []
         for _comp in completions:
             _th, _ = has_format_bonus(_comp)
@@ -950,7 +999,11 @@ def reward_fn(prompts, completions, **kwargs):
                     exec_score += atomic_val
 
         thought_reward = 0
-        if not NO_MEMORY:
+        if _mem_fast is not None:
+            if exec_score < 2.0 and thought is None:
+                thought = comp.strip()
+            thought_reward = _mem_fast[i]
+        elif not NO_MEMORY:
             if exec_score < 2.0:
                 if thought is None:
                     thought = comp.strip()
@@ -965,7 +1018,7 @@ def reward_fn(prompts, completions, **kwargs):
                 thought_reward = 1.0
 
         # If the execution score indicates correctness, persist the thought to memory.
-        if not NO_MEMORY and exec_score >= 2.0:
+        if not NO_MEMORY and exec_score >= 2.0 and _mem_fast is None:
             if thought:
                 # Quality gate: only save high-quality reasoning traces
                 prompt_for_quality = prompts[i] if isinstance(prompts, list) and i < len(prompts) else None
@@ -1006,7 +1059,7 @@ def reward_fn(prompts, completions, **kwargs):
                         print(f"[memory] Rejected thought due to low quality (score: {quality_score:.3f})")
 
         # Save failed reasoning traces to separate collection
-        if not NO_MEMORY and exec_score < 2.0:
+        if not NO_MEMORY and exec_score < 2.0 and _mem_fast is None:
             if thought:
                 prompt_for_quality = prompts[i] if isinstance(prompts, list) and i < len(prompts) else None
                 if not prompt_for_quality:
@@ -1094,7 +1147,7 @@ def reward_fn(prompts, completions, **kwargs):
                        "gold_unusable": (verdict.get("gold_unusable") if verdict else None),
                        "ts": time.time()})
 
-    if getattr(ARGS, "memory_embed_batch", False) and not NO_MEMORY:
+    if getattr(ARGS, "memory_embed_batch", False) and not NO_MEMORY and _mem_fast is None:
         _get_intrinsic().clear_embedding_cache()
     return rewards
 
