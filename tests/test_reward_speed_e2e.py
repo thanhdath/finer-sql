@@ -118,3 +118,16 @@ def test_flags_give_identical_rewards_and_store():
         assert [[l[k] for k in F] for l in got] == [[l[k] for k in F] for l in base], extra
         assert res["ids"] == base_res["ids"], extra
         assert len(res["embed_requests"]) == 2 and len(base_res["embed_requests"]) > 2, (extra, res["embed_requests"])
+
+
+@pytest.mark.skipif(not _api_up(), reason=f"db_execution API not reachable at {API_URL}")
+@pytest.mark.skipif(not os.path.isdir(TOKENIZER), reason="tokenizer dir absent")
+def test_dynamic_mask_keeps_rewards_and_signal_groups():
+    """--dynamic_sampling mask through the real reward_fn: reward terms unchanged, every rollout carries dyn_mask, and
+    since every group of this fixture has 2/4 paid rollouts nothing is masked, so the advantages equal the default's."""
+    F = ["format", "ex", "executable", "atomic", "memory", "exec_score", "total", "verdict_ok", "sql"]
+    _, base = _run([])
+    _, got = _run(["--dynamic_sampling", "mask"])
+    assert [[l[k] for k in F] for l in got] == [[l[k] for k in F] for l in base]
+    assert all(l.get("dyn_mask") is False for l in got) and all("dyn_mask" not in l for l in base)
+    assert [l["advantage"] for l in got] == [l["advantage"] for l in base]

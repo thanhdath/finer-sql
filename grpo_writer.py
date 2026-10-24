@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 import os
+import sys
 import re
 import argparse
 import time
@@ -141,9 +142,110 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--warmup_ratio", type=float, default=0.0, help="Fraction of steps to linearly warm up LR from 0 (e.g. 0.03 = 3%% of max_steps)")
     ap.add_argument("--warmup_steps", type=int, default=0, help="Number of absolute warmup steps (overrides warmup_ratio if >0)")
     ap.add_argument("--max_grad_norm", type=float, default=1.0, help="Gradient clipping max norm (default: 1.0)")
+    # [DAPO/LoRA 2026-10-24] opt-in; every default below leaves the original recipe unchanged
+    ap.add_argument("--dapo", action="store_true",
+                    help="DAPO preset: loss_type dapo, epsilon_high 0.28 (epsilon low stays TRL's 0.2), beta 0.0, "
+                         "--dynamic_sampling mask. A component given explicitly on the command line wins over the preset.")
+    ap.add_argument("--epsilon_high", type=float, default=None,
+                    help="Upper PPO clip (DAPO clip-higher); default None = TRL (= epsilon 0.2) = original behaviour")
+    ap.add_argument("--dynamic_sampling", default="off", choices=["off", "mask", "resample"],
+                    help="off (default) = original. mask = a group with no paid rollout (max ex < 2.0) or with every "
+                         "rollout paid gets zero advantage, and an optimizer step whose every group is masked is skipped "
+                         "(no Adam update; global_step/LR schedule still advance, so the seed-42 prompt order and resume "
+                         "are unchanged). resample = deferred (not implemented, see DAPO_LORA.md).")
+    ap.add_argument("--dyn_max_tries", type=int, default=3, help="resample only (deferred)")
+    ap.add_argument("--lora_r", type=int, default=0, help="LoRA rank; 0 (default) = full fine-tuning = original")
+    ap.add_argument("--lora_alpha", type=int, default=None, help="LoRA alpha; default 2*lora_r")
+    ap.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA dropout (default 0.0)")
+    ap.add_argument("--lora_target", default="all-linear",
+                    help="'all-linear' (default, every linear layer except lm_head) or a comma list, e.g. q_proj,v_proj")
+    ap.add_argument("--lora_no_merged_export", action="store_true",
+                    help="LoRA: do not write checkpoint-N/merged/ (full merged weights for eval)")
     return ap.parse_args()
 
+
+def _flag_given(argv: List[str], flag: str) -> bool:
+    return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+
+def resolve_dapo_preset(args: argparse.Namespace, argv: Optional[List[str]] = None) -> Dict[str, Any]:
+    """--dapo fills loss_type/epsilon_high/beta/dynamic_sampling unless the flag itself was given. Returns the
+    resolved values (also printed and written to <out_dir>/dapo_lora_recipe.json). No-op without --dapo."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if getattr(args, "dapo", False):
+        if not _flag_given(argv, "--loss_type"):
+            args.loss_type = "dapo"
+        if not _flag_given(argv, "--epsilon_high"):
+            args.epsilon_high = 0.28
+        if not _flag_given(argv, "--beta"):
+            args.beta = 0.0
+        if not _flag_given(argv, "--dynamic_sampling"):
+            args.dynamic_sampling = "mask"
+    return {"dapo": bool(getattr(args, "dapo", False)), "loss_type": args.loss_type, "epsilon_high": args.epsilon_high,
+            "beta": args.beta, "dynamic_sampling": args.dynamic_sampling}
+
+
+def build_lora_config(args: argparse.Namespace):
+    """peft LoraConfig from --lora_*; None when --lora_r 0 (full fine-tuning)."""
+    if not getattr(args, "lora_r", 0):
+        return None
+    from peft import LoraConfig
+    tgt = args.lora_target.strip()
+    target = "all-linear" if tgt == "all-linear" else [t.strip() for t in tgt.split(",") if t.strip()]
+    return LoraConfig(r=int(args.lora_r), lora_alpha=int(args.lora_alpha if args.lora_alpha is not None else 2 * args.lora_r),
+                      lora_dropout=float(args.lora_dropout), target_modules=target, bias="none", task_type="CAUSAL_LM")
+
+
+def dyn_group_keep(ex: List[float], num_generations: int) -> List[bool]:
+    """Per-rollout keep flag for --dynamic_sampling mask: a group (consecutive num_generations rollouts) is kept iff
+    1 <= #paid (ex >= 2.0) <= G-1."""
+    G = int(num_generations)
+    if len(ex) % G != 0:
+        raise ValueError(f"{len(ex)} rollouts is not a multiple of num_generations {G}")
+    keep: List[bool] = []
+    for g in range(0, len(ex), G):
+        paid = sum(1 for x in ex[g:g + G] if float(x) >= 2.0)
+        keep.extend([0 < paid < G] * G)
+    return keep
+
+
+def lora_merged_weights(peft_model) -> List[Tuple[str, Any]]:
+    """(HF parameter name, tensor) of the base model with every LoRA delta added, computed out of place in fp32 and
+    cast back once: the trained model is never mutated (TRL's merge_adapter/unmerge_adapter round-trips the bf16
+    base weights every sync and drifts them). LoRA parameters are dropped; names are the base model's names."""
+    import torch
+    from peft.tuners.lora import Linear as LoraLinear
+    mods = {n: m for n, m in peft_model.named_modules() if isinstance(m, LoraLinear)}
+    out: List[Tuple[str, Any]] = []
+    with torch.no_grad():
+        for name, param in peft_model.named_parameters():
+            if "lora_" in name or "original_module" in name:
+                continue
+            data = param.data
+            if name.endswith(".base_layer.weight") and name[: -len(".base_layer.weight")] in mods:
+                m = mods[name[: -len(".base_layer.weight")]]
+                for ad in m.active_adapters:
+                    if ad not in m.lora_A:
+                        continue
+                    if getattr(m, "use_dora", {}).get(ad, False) or getattr(m, "fan_in_fan_out", False):
+                        raise NotImplementedError("DoRA / fan_in_fan_out LoRA not supported by lora_merged_weights")
+                    delta = (m.lora_B[ad].weight.float() @ m.lora_A[ad].weight.float()) * float(m.scaling[ad])
+                    data = (data.float() + delta).to(param.dtype)
+            hf = name.removeprefix("base_model.model.").replace(".base_layer", "").replace("modules_to_save.default.", "")
+            out.append((hf, data))
+    return out
+
 ARGS = parse_args()
+DAPO_RECIPE = resolve_dapo_preset(ARGS)
+if ARGS.dapo or ARGS.dynamic_sampling != "off" or ARGS.epsilon_high is not None or ARGS.lora_r:
+    print(f"[dapo_lora] {DAPO_RECIPE} lora_r={ARGS.lora_r} lora_alpha={ARGS.lora_alpha} lora_dropout={ARGS.lora_dropout} "
+          f"lora_target={ARGS.lora_target}", flush=True)
+if ARGS.dynamic_sampling == "resample":
+    raise SystemExit("[dapo_lora] --dynamic_sampling resample is deferred (TRL 0.25.1 draws one generation batch per "
+                     "optimizer step from HF's epoch iterator; extra draws would break the resume skip/train_order audit). "
+                     "Use --dynamic_sampling mask.")
+DYN_MODE = ARGS.dynamic_sampling
+_LAST_EX: List[float] = []   # ex (2.0 paid / 0.0) of the last reward call, completion order; filled only when DYN_MODE != off
 
 MODEL_PATH = ARGS.model_path
 OUT_DIR = ARGS.out_dir
@@ -285,7 +387,7 @@ class _RolloutDump:
     def add(self, rec: Dict[str, Any]) -> None:
         self.pending.append(rec)
 
-    def flush(self, step: Optional[int] = None, advantages=None) -> None:
+    def flush(self, step: Optional[int] = None, advantages=None, dyn_mask: Optional[List[bool]] = None) -> None:
         recs, self.pending = self.pending, []
         if not recs:
             return
@@ -298,9 +400,13 @@ class _RolloutDump:
         if adv is not None and len(adv) != len(recs):
             self.misaligned += 1
             adv = None
+        if dyn_mask is not None and len(dyn_mask) != len(recs):
+            dyn_mask = None
         for k, r in enumerate(recs):
             r["step"] = step
             r["advantage"] = (adv[k] if adv is not None else None)
+            if dyn_mask is not None:
+                r["dyn_mask"] = bool(dyn_mask[k])   # True = group masked (zero advantage)
             try:
                 self.fh.write(self.json.dumps(r, default=str) + "\n")
                 self.written += 1
@@ -850,6 +956,8 @@ def reward_fn(prompts, completions, **kwargs):
         print(f"[sample_ids] call={_reward_call_count} n={len(completions)} ids={_ids}", flush=True)
 
     rewards: List[float] = []
+    if DYN_MODE != "off":
+        _LAST_EX.clear()
     if _DUMP is not None and _DUMP.pending:
         _DUMP.flush(None, None)     # a previous batch missed its flush point: write it without step/advantage
     sample_ids = kwargs.get("sample_id") or [None] * len(completions)
@@ -1136,6 +1244,8 @@ def reward_fn(prompts, completions, **kwargs):
             print(f"[/SAMPLE]\n")
 
         rewards.append(float(total))
+        if DYN_MODE != "off":
+            _LAST_EX.append(2.0 if exec_score >= 2.0 else 0.0)
         if _DUMP is not None:
             _DUMP.add({"call": _reward_call_count, "index": i, "dataset_name": dset, "sample_id": sample_ids[i], "db_id": db_id,
                        "sql": pred_sql, "format": float(format_reward), "ex": (2.0 if exec_score >= 2.0 else 0.0),
@@ -1161,9 +1271,52 @@ class APIAwareGRPOTrainer(GRPOTrainer):
         super().__init__(*args, **kwargs)
         self.api_dead_count = 0
         self.max_api_dead_retries = API_MAX_RETRIES
-    
+        self._dyn_mode = DYN_MODE if "DYN_MODE" in globals() else "off"
+        self._dyn_skipped = 0
+        self._dyn_steps = 0
+        self._dyn_step_signal = False
+        if self._dyn_mode != "off" and self.accelerator.num_processes != 1:
+            raise SystemExit("[dyn] --dynamic_sampling needs a single process (reward ex order = completion order)")
+
+    def create_optimizer(self):
+        """--dynamic_sampling mask: wrap optimizer.step so that an optimizer step none of whose micro-batches holds a
+        kept (signal) rollout is skipped: no Adam update, no momentum drift. HF still advances global_step and the
+        LR scheduler, so prompt order, save/resume points and the schedule's time axis are unchanged."""
+        opt = super().create_optimizer()
+        if self._dyn_mode == "mask" and not getattr(opt, "_dyn_wrapped", False):
+            import types
+            orig_step = opt.step
+            trainer = self
+
+            def step(_opt, *a, **k):   # bound method: torch's LR scheduler re-wraps optimizer.step via __func__
+                trainer._dyn_steps += 1
+                signal, trainer._dyn_step_signal = trainer._dyn_step_signal, False
+                if signal:
+                    trainer._metrics["train"]["dyn/step_skipped"].append(0.0)
+                    trainer._metrics["train"]["dyn/skipped"].append(float(trainer._dyn_skipped))
+                    return orig_step(*a, **k)
+                trainer._dyn_skipped += 1
+                trainer._metrics["train"]["dyn/step_skipped"].append(1.0)
+                trainer._metrics["train"]["dyn/skipped"].append(float(trainer._dyn_skipped))
+                print(f"[dyn] optimizer step {trainer.state.global_step + 1} skipped (every group masked); "
+                      f"skipped {trainer._dyn_skipped}/{trainer._dyn_steps}", flush=True)
+                return None
+
+            opt.step = types.MethodType(step, opt)
+            opt._dyn_wrapped = True
+        return opt
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """Override compute_loss to handle API dead scenarios."""
+        if self._dyn_mode == "mask" and "dyn_keep" in inputs:
+            keep = inputs["dyn_keep"]
+            if bool(keep.any()):
+                self._dyn_step_signal = True
+            elif self.beta == 0.0 and model.training:
+                # every advantage of this micro-batch is 0 and there is no KL term: the loss and its gradient are
+                # exactly zero, so skip the forward/backward (a leaf zero keeps HF's backward() call valid)
+                import torch
+                return torch.zeros((), device=keep.device, requires_grad=True)
         try:
             return super().compute_loss(model, inputs, return_outputs, **kwargs)
         except Exception as e:
@@ -1192,13 +1345,57 @@ class APIAwareGRPOTrainer(GRPOTrainer):
         """--dump_rollouts: after TRL scored a generation batch, write the pending rollout records with the trainer's
         global_step and the advantages of the same batch (same completion order). No-op when the flag is off."""
         out = super()._generate_and_score_completions(inputs)
+        dyn_masked = None
+        if self._dyn_mode == "mask" and self.model.training:
+            out, dyn_masked = self._apply_dyn_mask(out)
         if _DUMP is not None:
             try:
                 adv = out.get("advantages") if isinstance(out, dict) else None
-                _DUMP.flush(int(self.state.global_step), adv)
+                _DUMP.flush(int(self.state.global_step), adv, *(() if dyn_masked is None else (dyn_masked,)))
             except Exception as e:  # never let logging reach the training step
                 print(f"[dump_rollouts] flush failed: {type(e).__name__}: {e}")
         return out
+
+    def _apply_dyn_mask(self, out):
+        """Zero the advantages of masked groups (torch.where: kept rows are bit-for-bit TRL's) and attach the per-row
+        keep flag `dyn_keep` (split/shuffled with the batch by TRL like any other per-row tensor)."""
+        import torch
+        adv = out["advantages"]
+        ex = list(_LAST_EX)
+        if len(ex) != adv.shape[0]:
+            raise RuntimeError(f"[dyn] {len(ex)} ex values for {adv.shape[0]} advantages")
+        keep = torch.tensor(dyn_group_keep(ex, self.num_generations), dtype=torch.bool, device=adv.device)
+        out["advantages"] = torch.where(keep, adv, torch.zeros_like(adv))
+        out["dyn_keep"] = keep
+        n_groups = len(ex) // self.num_generations
+        kept = int(keep.sum().item()) // self.num_generations
+        self._metrics["train"]["dyn/kept"].append(float(kept))
+        self._metrics["train"]["dyn/masked"].append(float(n_groups - kept))
+        return out, [not bool(k) for k in keep.tolist()]
+
+    def _move_model_to_vllm(self):
+        """LoRA (single process, no FSDP/ZeRO-3): push base+delta weights computed out of place (lora_merged_weights)
+        instead of TRL's in-place merge_adapter()/unmerge_adapter(), which re-rounds the bf16 base weights every sync.
+        Everything else: TRL's own _move_model_to_vllm."""
+        from accelerate.utils import is_peft_model
+        ds = self.accelerator.state.deepspeed_plugin
+        if not (is_peft_model(self.model) and self.vllm_mode == "colocate" and not self.is_fsdp_enabled
+                and not (ds is not None and ds.zero_stage == 3)):
+            return super()._move_model_to_vllm()
+        llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+        for name, data in lora_merged_weights(self.model):
+            llm_model.load_weights([(self._fix_param_name_to_vllm(name), data)])
+        self.llm.reset_prefix_cache()
+
+    def _save_checkpoint(self, model, trial):
+        super()._save_checkpoint(model, trial)
+        from accelerate.utils import is_peft_model
+        if is_peft_model(self.model) and not ARGS.lora_no_merged_export and self.accelerator.is_main_process:
+            try:
+                ck = os.path.join(self._get_output_dir(trial=trial), f"checkpoint-{self.state.global_step}")
+                export_lora_merged(self.model, os.path.join(ck, "merged"), self.processing_class)
+            except Exception as e:  # never let the export stop training
+                print(f"[lora] merged export failed: {type(e).__name__}: {e}")
 
     def _get_train_sampler(self, dataset=None):
         """TRL 0.25.1 seeds its RepeatSampler with args.seed and ignores args.data_seed.
@@ -1211,6 +1408,27 @@ class APIAwareGRPOTrainer(GRPOTrainer):
             sampler.seed = data_seed
             sampler.generator.manual_seed(data_seed)
         return sampler
+
+
+def export_lora_merged(peft_model, out_dir: str, processing_class=None) -> str:
+    """Write a plain HF model dir (config.json + model.safetensors [+ tokenizer]) with the LoRA deltas merged, for
+    vLLM/HF evaluation. Kept in checkpoint-N/merged/ so HF resume (adapter files at checkpoint-N/) is unaffected."""
+    from safetensors.torch import save_file
+    os.makedirs(out_dir, exist_ok=True)
+    sd = {n: t.detach().to("cpu").contiguous() for n, t in lora_merged_weights(peft_model)}
+    base = peft_model.get_base_model()
+    if getattr(base.config, "tie_word_embeddings", False):
+        sd.pop("lm_head.weight", None)
+    save_file(sd, os.path.join(out_dir, "model.safetensors"), metadata={"format": "pt"})
+    base.config.save_pretrained(out_dir)
+    if getattr(base, "generation_config", None) is not None:
+        try:
+            base.generation_config.save_pretrained(out_dir)
+        except Exception:
+            pass
+    if processing_class is not None:
+        processing_class.save_pretrained(out_dir)
+    return out_dir
 
 
 def train_order_fingerprint(sampler, args, dataset, max_steps: int) -> Dict[str, Any]:
@@ -1518,6 +1736,7 @@ def main():
         max_completion_length=MAX_COMPLETION_LENGTH,
         temperature=1.0,
         beta=ARGS.beta,
+        **({"epsilon_high": ARGS.epsilon_high} if ARGS.epsilon_high is not None else {}),
         warmup_ratio=ARGS.warmup_ratio,
         warmup_steps=ARGS.warmup_steps,
         max_grad_norm=ARGS.max_grad_norm,
@@ -1542,7 +1761,23 @@ def main():
         args=training_args,
         train_dataset=dataset,
         reward_funcs=reward_fn,
+        **({"peft_config": build_lora_config(ARGS)} if ARGS.lora_r else {}),
     )
+    if ARGS.dapo or DYN_MODE != "off" or ARGS.lora_r:
+        import json as _json
+        os.makedirs(OUT_DIR, exist_ok=True)
+        _rec = dict(DAPO_RECIPE, epsilon=training_args.epsilon, epsilon_high_resolved=trainer.epsilon_high,
+                    loss_type_resolved=trainer.loss_type, beta_resolved=trainer.beta, lora_r=ARGS.lora_r,
+                    lora_alpha=(ARGS.lora_alpha if ARGS.lora_alpha is not None else 2 * ARGS.lora_r) if ARGS.lora_r else None,
+                    lora_dropout=ARGS.lora_dropout if ARGS.lora_r else None, lora_target=ARGS.lora_target if ARGS.lora_r else None,
+                    learning_rate=LEARNING_RATE)
+        if ARGS.lora_r:
+            _tr = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
+            _all = sum(p.numel() for p in trainer.model.parameters())
+            _rec.update(trainable_params=int(_tr), all_params=int(_all))
+        with open(os.path.join(OUT_DIR, "dapo_lora_recipe.json"), "w") as f:
+            _json.dump(_rec, f, indent=1)
+        print(f"[dapo_lora] recipe {_rec}", flush=True)
     write_train_order(trainer, OUT_DIR, MAX_STEPS)
 
     if ARGS.resume_from_checkpoint:
