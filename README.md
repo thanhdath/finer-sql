@@ -13,6 +13,11 @@
 [bird_dev_prompts](https://huggingface.co/datasets/griffith-bigdata/bird_dev_prompts) ·
 [spider_dev_prompts](https://huggingface.co/datasets/griffith-bigdata/spider_dev_prompts)
 
+**Update (2026-11-17):** FINER-SQL-v2, trained on [CoRE-DB](https://github.com/thanhdath/core-db), is released:
+[FINER-SQL-3B-v2](https://huggingface.co/griffith-bigdata/FINER-SQL-3B-v2) ·
+[FINER-SQL-1.5B-v2](https://huggingface.co/griffith-bigdata/FINER-SQL-1.5B-v2) ·
+[FINER-SQL-0.5B-v2](https://huggingface.co/griffith-bigdata/FINER-SQL-0.5B-v2)
+
 #### Citation
 ```
 @inproceedings{finersql,
@@ -49,6 +54,16 @@ pip install flash-attn==2.6.3 --no-build-isolation
 
 
 ## Experiment Results
+
+### FINER-SQL-v2 (trained on CoRE-DB)
+
+| Model | BIRD Dev (EX) | Spider Dev (EX) | Spider Dev (TS) | Spider Test (EX) |
+|---|---:|---:|---:|---:|
+| [FINER-SQL-0.5B-v2](https://huggingface.co/griffith-bigdata/FINER-SQL-0.5B-v2) | 53.59 | 76.31 | 67.89 | 75.27 |
+| [FINER-SQL-1.5B-v2](https://huggingface.co/griffith-bigdata/FINER-SQL-1.5B-v2) | 63.82 | 79.98 | 72.44 | 81.79 |
+| [FINER-SQL-3B-v2](https://huggingface.co/griffith-bigdata/FINER-SQL-3B-v2) | 68.84 | 86.75 | 81.53 | 87.66 |
+
+Code and reproduction: https://github.com/thanhdath/core-db
 
 ### BIRD Dev (n=1534)
 
@@ -156,14 +171,6 @@ finer-sql/
 ```
 
 ---
-
-## TODO
-
-1. Merge Spider & BIRD specialists into a single unified model per size.
-2. Train GRPO on SynSQL-2.5M with FINER-SQL's dense rewards.
-
----
-
 
 -----------
 **Backup Statistics**
